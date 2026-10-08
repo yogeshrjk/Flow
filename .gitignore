@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/sessions/*.json
+data/profiles/*.json
+!data/sessions/.gitkeep
+!data/profiles/.gitkeep
+.DS_Store
+node_modules/

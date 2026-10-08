@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Flow</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<link rel="stylesheet" href="/static/styles.css?v=41" />
+</head>
+<body>
+<canvas id="orb" class="wavefull" width="1280" height="240"></canvas>
+<div class="stage">
+
+  <header class="topbar">
+    <div class="brand"><span id="dot" class="dot idle"></span><span id="state">READY</span><span id="micLive" class="miclive" title="microphone live"></span></div>
+    <div id="clock" class="clock">0:00</div>
+  </header>
+
+  <aside id="history" class="sidebar hidden">
+    <div id="emptyHint" class="emptyhint">Your conversation will appear here…</div>
+    <div id="transcript" class="transcript side"></div>
+    <div id="chatSmoke" class="chatsmoke">
+      <div class="smoke-wisp wisp1"></div>
+      <div class="smoke-wisp wisp2"></div>
+      <div class="smoke-wisp wisp3"></div>
+    </div>
+  </aside>
+
+  <main class="center">
+    <div id="greetLine" class="greetline"></div>
+    <div id="aiLine" class="ailine"></div>
+    <div id="hearNote" class="hearnote"></div>
+  </main>
+
+  <footer class="dockwrap">
+    <div id="userLine" class="userline"></div>
+    <div id="chatInput" class="inputpill hidden">
+      <input id="textInput" placeholder="Type instead of speaking…" autocomplete="off" />
+      <button id="sendBtn" class="iconbtn sm" aria-label="Send"><i data-lucide="arrow-up"></i></button>
+    </div>
+    <div class="dock">
+      <button id="captionBtn" class="iconbtn hidden" aria-label="Toggle captions"><i data-lucide="captions"></i></button>
+      <button id="interruptBtn" class="iconbtn hidden" aria-label="Interrupt" disabled><i data-lucide="hand"></i></button>
+      <button id="startBtn" class="iconbtn primary" aria-label="Start or stop voice chat"><i data-lucide="play"></i></button>
+      <button id="micMuteBtn" class="iconbtn hidden" aria-label="Mute microphone"><i data-lucide="mic"></i></button>
+      <button id="muteBtn" class="iconbtn hidden" aria-label="Mute speaker"><i data-lucide="volume-2"></i></button>
+    </div>
+  </footer>
+
+  <button id="historyBtn" class="iconbtn histbtn" aria-label="Conversation history"><i data-lucide="message-square"></i></button>
+  <button id="settingsBtn" class="iconbtn settings" aria-label="Settings"><i data-lucide="settings"></i></button>
+
+  <aside id="panel" class="panel hidden">
+    <div class="panelhead">
+      <span class="ptitle">Settings</span>
+      <button id="panelClose" class="iconbtn sm ghost" aria-label="Close"><i data-lucide="x"></i></button>
+    </div>
+    <div class="panelbody">
+
+      <div class="sect">AI Response</div>
+      <div id="respModes" class="radios"></div>
+      <div id="respNote" class="pnote"></div>
+
+      <div class="sect">Experience</div>
+      <label class="fld"><span class="flbl"><i data-lucide="sparkles"></i>Animation</span>
+        <select id="anim">
+          <option value="mobius" selected>Infinity Möbius</option>
+          <option value="aurora">Aurora Silk</option>
+          <option value="particles">Particle Ribbon</option>
+          <option value="nebula">Nebula Drift</option>
+        </select></label>
+      <label class="fld"><span class="flbl"><i data-lucide="mic"></i>Microphone</span>
+        <select id="micDevice"></select></label>
+      <div class="prow">
+        <button id="micTestBtn" class="textbtn"><i data-lucide="activity"></i>Test mic</button>
+        <span id="micTestStatus" class="pnote"></span>
+      </div>
+      <label class="fld"><span class="flbl"><i data-lucide="audio-lines"></i>Voice</span>
+        <select id="voice"></select></label>
+      <div class="prow">
+        <button id="fishTestBtn" class="textbtn"><i data-lucide="play"></i>Test voice</button>
+        <span id="fishStatus" class="pnote"></span>
+      </div>
+      <label class="fld"><span class="flbl"><i data-lucide="languages"></i>Language</span>
+        <select id="language">
+          <option value="english" selected>English</option>
+          <option value="hindi">Hindi</option>
+          <option value="hinglish">Hinglish</option>
+        </select></label>
+
+      <div class="sect">Coaching</div>
+      <label class="fld"><span class="flbl"><i data-lucide="messages-square"></i>Mode</span>
+        <select id="mode">
+          <option value="free" selected>Free Conversation</option>
+          <option value="practice">English Practice</option>
+        </select></label>
+      <div id="practiceOptions" class="practice-options hidden">
+        <label class="fld"><span class="flbl"><i data-lucide="theater"></i>Scenario</span>
+          <select id="scenario"></select></label>
+        <div class="grid2">
+          <label class="fld"><span class="flbl"><i data-lucide="circle-check"></i>Correction</span>
+            <select id="correction">
+              <option value="passive">Passive</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="active">Active</option>
+            </select></label>
+          <label class="fld"><span class="flbl"><i data-lucide="signal"></i>Level</span>
+            <select id="level">
+              <option value="auto" selected>Auto</option>
+              <option value="beginner">Beginner</option>
+              <option value="elementary">Elementary</option>
+              <option value="intermediate">Intermediate</option>
+              <option value="upper">Upper Intermediate</option>
+              <option value="advanced">Advanced</option>
+            </select></label>
+        </div>
+      </div>
+
+      <div class="sect">Session</div>
+      <div class="prow">
+        <button id="challengeBtn" class="textbtn"><i data-lucide="target"></i>Daily challenge</button>
+        <button id="endBtn" class="textbtn" disabled><i data-lucide="clipboard-check"></i>End + summary</button>
+      </div>
+      <div id="feedback" class="feedback">Feedback appears here after you talk.</div>
+      <details class="dbg"><summary>Debug log</summary><pre id="log" class="log"></pre></details>
+
+    </div>
+  </aside>
+  <div id="scrim" class="scrim hidden"></div>
+
+</div>
+<script src="/static/vad.js?v=26"></script>
+<script src="/static/audio.js?v=35"></script>
+<script src="/static/orb.js?v=48"></script>
+<script src="/static/app.js?v=70"></script>
+</body>
+</html>
