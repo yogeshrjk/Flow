@@ -1368,13 +1368,15 @@ async function connect() {
       if (m.turn === 'greet' && userTurns > 0) return; // Drop reconnect greeting audio mid-session
       const stale = !!(m.turn && audioQ.deadTurns.has(m.turn));
       if (m.lat && !stale) audioQ.turnLat = m.lat;  // server stages for the latency block
-      audioQ.enqueue(m.text, { stream: !!m.first, turn: m.turn });
+      audioQ.enqueue(m.text, { stream: !!m.first, turn: m.turn, req_id: m.req_id || m.turn });
     }
     else if (m.type === 'live_audio_chunk') {
       audioQ.playLivePcmChunk(m.data, 24000, m.turn);
     }
     else if (m.type === 'response_mode') { labelFor(m.value); log('[AI] mode confirmed:', respModeLabel); }
     else if (m.type === 'llm_done') {
+      const reqId = m.req_id || m.turn || String(turnSeq);
+      log(`[LLM req_id=${reqId}] LLM response received in client (chars=${(m.text || '').length})`);
       hideTypingIndicator();
       fullReply = '';
       const displayText = m.display_text || m.text;
@@ -1384,6 +1386,7 @@ async function connect() {
       if (!m.greeting || userTurns === 0) {
         addTurn('Partner', displayText);
       }
+      log(`[UI req_id=${reqId}] assistant message rendered in chat`);
       if (m.live) {
         // Live ticker owns the center line until the voice drains: never dump
         // the paragraph here. Hand it the final text and let it converge.
@@ -1404,6 +1407,8 @@ async function connect() {
         if (running && state !== 'INTERRUPTED') setState('LISTENING');
       }
     } else if (m.type === 'llm_cancelled') {
+      const reqId = m.req_id || m.turn || String(turnSeq);
+      log(`[TURN req_id=${reqId}] turn cancelled`);
       hideTypingIndicator();
       fullReply = '';
       try { LiveCaptions.stop(); } catch (e) {}
@@ -1422,8 +1427,9 @@ async function connect() {
       log('[TTS] voice selection rejected:', m.error || m.value);
     }
     else if (m.type === 'error') {
+      const reqId = m.req_id || m.turn || String(turnSeq);
       hideTypingIndicator();
-      log(`[${m.scope}] error:`, m.message);
+      log(`[ERROR req_id=${reqId}] stage=${m.stage || m.scope || 'unknown'} error=${sanitizeError(m.message)}`);
       if (running) setState('LISTENING');
     }
   };
@@ -1439,14 +1445,25 @@ async function connect() {
   }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+function initApp() {
   loadConfig();
   loadMicDevices();
   loadChatHistoryUI();
   initChatSmoke();
   icons();
   if ($('clearChatBtn')) $('clearChatBtn').onclick = clearChatHistory;
-});
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
+}
+
+function sanitizeError(err) {
+  const s = String(err || '');
+  return s.replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Bearer [REDACTED]')
+          .replace(/(key|token|secret|authorization)=['"][^'"]+['"]/gi, '$1=[REDACTED]');
+}
 
 function normText(s) {
   return (s || '')
@@ -1466,10 +1483,31 @@ function sameText(a, b, thr = 0.75) {
   for (const w of ys) if (xs.has(w)) hit++;
   return hit / Math.max(ys.length, 1) >= thr;
 }
-function sendText(text) {
-  if (!ws || ws.readyState !== 1) return;
+async function sendText(text) {
   text = (text || '').trim();
   if (!text) return;
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log('[TURN] WebSocket not ready — connecting now...');
+    try {
+      await connect();
+    } catch (e) {
+      log('[ERROR] stage=WEBSOCKET error=Connection failed');
+      hearNote('Connecting to server... Please try again.');
+      return;
+    }
+    let waitCount = 0;
+    while (ws && ws.readyState === WebSocket.CONNECTING && waitCount < 30) {
+      await new Promise(r => setTimeout(r, 100));
+      waitCount++;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      log('[ERROR] stage=WEBSOCKET error=WebSocket not open');
+      hearNote('Could not connect to server. Please try again.');
+      return;
+    }
+  }
+
   // Guard against duplicate send of the exact same utterance within 1.2s
   if (lastSentText && (performance.now() - lastSentAt < 1200) && sameText(text, lastSentText, 0.85)) {
     log('[TURN] duplicate turn suppressed:', JSON.stringify(text));
@@ -1490,11 +1528,13 @@ function sendText(text) {
   // latency anchors: the client clock marks the moment the user stopped talking
   turnSeq += 1;
   const turnId = String(turnSeq);
+  const reqId = 'req_' + turnId + '_' + Date.now();
   audioQ._turnId = turnId;   // string: the server echoes ids back as strings
   audioQ._turnT0 = performance.now();
   audioQ._expectFirst = true;
   audioQ.turnLat = null;
-  ws.send(JSON.stringify({ type: 'user_transcript', text, t0: Date.now(), turn_id: turnId }));
+  log(`[CHAT req_id=${reqId}] text submission started: "${text.slice(0, 80)}"`);
+  ws.send(JSON.stringify({ type: 'user_transcript', text, t0: Date.now(), turn_id: turnId, req_id: reqId }));
 }
 const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || ('ontouchstart' in window && window.innerWidth < 800);
 

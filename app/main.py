@@ -144,7 +144,7 @@ async def fish_voice_validation_error(voice_id: str):
 async def tts(req: TTSReq):
     """Voice synthesis: routes to Gemini Live native voice or Fish Audio."""
     from fastapi.responses import Response
-    from app.conversation.engine import clean_for_speech
+    from app.conversation.engine import clean_for_speech, sanitize_error
     raw_text = (req.text or "").strip()[:800]
     if not raw_text:
         return JSONResponse({"error": "empty text"}, status_code=400)
@@ -157,18 +157,22 @@ async def tts(req: TTSReq):
     if is_gemini_voice:
         from app.providers.tts.gemini import GeminiTTSProvider
         g_voice = vid if vid in {v["id"] for v in GEMINI_VOICES} else DEFAULT_GEMINI_VOICE
+        log.info(f"[TTS] request started engine=gemini voice={g_voice} chars={len(text)}")
         audio, err = await GeminiTTSProvider().synthesize(text, voice_name=g_voice)
         if audio:
             return Response(content=audio, media_type="audio/wav")
+        log.warning(f"[ERROR] stage=TTS engine=gemini error={sanitize_error(err)}")
         return JSONResponse({"error": err or "gemini live audio failed"}, status_code=402)
 
     voice_error = await fish_voice_validation_error(vid or "")
     if voice_error:
         return voice_error
     from app.providers.tts.fish import FishProvider
+    log.info(f"[TTS] request started engine=fish voice={vid} chars={len(text)}")
     audio, err = await FishProvider().synthesize(text, voice_id=vid)
     if audio:
         return Response(content=audio, media_type="audio/mpeg")
+    log.warning(f"[ERROR] stage=TTS engine=fish error={sanitize_error(err)}")
     return JSONResponse({"error": err or "fish failed"}, status_code=402)
 
 
@@ -176,7 +180,7 @@ async def tts(req: TTSReq):
 async def tts_stream(text: str = "", voice: str = "", engine: str = ""):
     """Progressive voice streaming."""
     from fastapi.responses import StreamingResponse
-    from app.conversation.engine import clean_for_speech
+    from app.conversation.engine import clean_for_speech, sanitize_error
     raw_txt = (text or "").strip()[:800]
     if not raw_txt:
         return JSONResponse({"error": "empty text"}, status_code=400)
@@ -192,8 +196,10 @@ async def tts_stream(text: str = "", voice: str = "", engine: str = ""):
     voice_error = await fish_voice_validation_error(vid or "")
     if voice_error:
         return voice_error
+    log.info(f"[TTS] stream request started engine=fish voice={vid} chars={len(txt)}")
     it, err = await FishProvider().open_stream(txt, voice_id=vid)
     if it is None:
+        log.warning(f"[ERROR] stage=TTS_STREAM error={sanitize_error(err)}")
         return JSONResponse({"error": err or "fish failed"}, status_code=402)
     return StreamingResponse(it, media_type="audio/mpeg", headers={
         "Cache-Control": "no-store",
@@ -257,14 +263,16 @@ async def ws_session(ws: WebSocket, sid: str, lang: str = ""):
                 # cancel any in-flight reply (barge-in safety)
                 engine.cancel(s.id)
                 # t0/turn_id come from the client so "speech_end → first audio" is real
+                turn_id = str(msg.get("turn_id", ""))
+                req_id = str(msg.get("req_id") or turn_id or s.id)
                 task = asyncio.create_task(engine.handle_user_turn(
                     s, msg.get("text", ""), send, t0,
-                    t_speech_end_ms=msg.get("t0"), turn_id=str(msg.get("turn_id", ""))))
+                    t_speech_end_ms=msg.get("t0"), turn_id=turn_id, req_id=req_id))
                 engine.tasks[s.id] = task
                 # never await here: the receive loop must keep reading, otherwise a
                 # barge_in (or the next turn) can't cancel this turn mid-reply
                 task.add_done_callback(lambda t: t.cancelled() or
-                                       (t.exception() and log.warning(f"[TURN] task error: {t.exception()}")))
+                                       (t.exception() and log.warning(f"[TURN req_id={req_id}] task error: {t.exception()}")))
             elif mtype == "partial":
                 # useful for interruption prediction / latency logging only
                 log.info(f"[STT] partial sid={s.id} {str(msg.get('text',''))[:80]!r}")

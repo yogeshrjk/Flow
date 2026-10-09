@@ -119,20 +119,23 @@ class AudioQueue {
   get busy() { return this.playing || this.q.length > 0; }
   enqueue(text, opts) {
     if (!text || !text.trim()) return;
+    const turn = (opts && opts.turn) || '';
+    const reqId = (opts && opts.req_id) || turn || '';
     // stale audio from an interrupted turn must never resume
-    if (opts && opts.turn && this.deadTurns.has(opts.turn)) {
-      this._log('dropped stale audio from an interrupted turn');
+    if (turn && this.deadTurns.has(turn)) {
+      this._log(`[AUDIO req_id=${reqId || 'n/a'}] dropped stale audio from an interrupted turn`);
       return;
     }
+    this._log(`[TTS req_id=${reqId || 'n/a'}] TTS request queued text="${text.slice(0, 40)}" (stream=${!!(opts && opts.stream)})`);
     // opts.stream: play this phrase progressively (first phrase of a turn — the
     // browser starts talking on the first frames instead of the whole mp3)
-    this.q.push({ text, stream: !!(opts && opts.stream), turn: (opts && opts.turn) || '' });
+    this.q.push({ text, stream: !!(opts && opts.stream), turn, req_id: reqId });
     try { this.onSpeaking && this.onSpeaking(); } catch (e) {}
     if (this.playing) this._prefetch();
     this.pump();
   }
   _key(text) { return (this.engine || 'fish') + '|' + (this.fishVoice || 'default') + '|' + text; }
-  _fetchOne(text) {
+  _fetchOne(text, reqId = '') {
     const voice = this.fishVoice || '';
     const engine = this.engine || 'fish';
     const gen = this._gen;
@@ -140,6 +143,7 @@ class AudioQueue {
     this._aborts.add(ac);
     const t0 = performance.now();
     const stamp = (extra) => ({ t0, t1: performance.now(), ...extra });
+    this._log(`[TTS req_id=${reqId || 'n/a'}] TTS fetch request started text="${text.slice(0, 40)}" engine=${engine}`);
     return (async () => {
       try {
         const r = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, voice, engine }), signal: ac.signal });
@@ -161,10 +165,11 @@ class AudioQueue {
   _prefetch() {
     // download the waiting line(s) in the background while the current one
     // plays — so there is no network gap between sentences
-    for (const t of this.q.slice(0, 3).map((i) => i.text)) {
+    for (const item of this.q.slice(0, 3)) {
+      const t = item.text;
       const k = this._key(t);
       if (!this._cache.has(k)) {
-        this._cache.set(k, this._fetchOne(t));
+        this._cache.set(k, this._fetchOne(t, item.req_id));
         if (this._cache.size > 6) {
           const oldest = this._cache.keys().next().value;
           if (oldest !== k) this._cache.delete(oldest);
@@ -178,6 +183,7 @@ class AudioQueue {
     if (!item) { try { this.onDrained && this.onDrained(); } catch (e) {} return; }
     const next = item.text;
     const gen = this._gen;
+    const reqId = item.req_id || item.turn || '';
     this.playing = true;
     try { this.onSpeaking && this.onSpeaking(); } catch (e) {}
     const t0 = performance.now();
@@ -185,18 +191,26 @@ class AudioQueue {
     if (item.stream) {
       // First phrase of the turn: play it progressively. Fish emits mp3 frames
       // while it synthesises, so sound starts ~1s before the body is complete.
-      const res = await this._playStream(next, performance.now(), item.turn);
+      this._log(`[TTS req_id=${reqId || 'n/a'}] TTS stream request started text="${next.slice(0, 40)}"`);
+      const res = await this._playStream(next, performance.now(), item.turn, reqId);
       if (res.ok) {
-        this._log(`streamed first phrase (${next.length} chars)`);
+        this._log(`[AUDIO req_id=${reqId || 'n/a'}] streamed first phrase completed (${next.length} chars)`);
       } else if (res.reason !== 'cancelled') {
-        this._log('stream playback failed:', res.reason, '— retrying as a full download');
-        const j = await this._fetchOne(next);
+        this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_STREAM error=${res.reason} — retrying as a full download`);
+        const j = await this._fetchOne(next, reqId);
         if (j.url && !this.cancelled && gen === this._gen) {
           // pass the turn through: a retry of an old turn must not be reported
           // as the current turn's first audio
-          const r2 = await this.playUrl(j.url, next, j, item.turn);
+          const r2 = await this.playUrl(j.url, next, j, item.turn, reqId);
           try { URL.revokeObjectURL(j.url); } catch (e) {}
-          if (!r2.ok) this._log('stream retry failed:', r2.reason);
+          if (!r2.ok) this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_DOWNLOAD error=${r2.reason}`);
+        } else if (!j.url && !this.cancelled && gen === this._gen) {
+          this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_DOWNLOAD error=${j.err}`);
+          try { this.onError && this.onError(j.err); } catch (e) {}
+          // Fallback display when TTS is completely unavailable
+          try { this.onSentenceStart && this.onSentenceStart(next); } catch (e) {}
+          const readTime = Math.max(1500, next.length * 55);
+          await new Promise(r => setTimeout(r, readTime));
         }
       }
       if (!this.cancelled) await new Promise(r => setTimeout(r, 25));
@@ -207,20 +221,21 @@ class AudioQueue {
     const ck = this._key(next);
     let job = this._cache.get(ck);
     this._cache.delete(ck);
-    if (!job) job = this._fetchOne(next);
+    if (!job) job = this._fetchOne(next, reqId);
+    this._log(`[TTS req_id=${reqId || 'n/a'}] TTS request processing text="${next.slice(0, 40)}"`);
     const { url, err } = await job;
     if (this.cancelled || gen !== this._gen) { try { url && URL.revokeObjectURL(url); } catch (e) {} this.playing = false; if (!this.cancelled) this.pump(); return; }
     if (url) {
-      const res = await this.playUrl(url, next, job, item.turn);
+      const res = await this.playUrl(url, next, job, item.turn, reqId);
       try { URL.revokeObjectURL(url); } catch (e) {}
-      if (res.ok) this._log(`playing (${next.length} chars)`);
+      if (res.ok) this._log(`[AUDIO req_id=${reqId || 'n/a'}] playing completed (${next.length} chars)`);
       else if (res.reason !== 'cancelled') {
-        this._log('PLAYBACK FAILED:', res.reason, '— tap "Test voice" and read the status line');
+        this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=AUDIO_PLAYBACK error=${res.reason}`);
         try { this.onError && this.onError('Browser refused to play audio (' + res.reason + '). Tap Test voice.'); } catch (e) {}
       }
       this._prefetch();
     } else {
-      this._log('fetch failed:', err);
+      this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS error=${err}`);
       try { this.onError && this.onError(err); } catch (e) {}
       // Fallback display when TTS is unavailable
       try { this.onSentenceStart && this.onSentenceStart(next); } catch (e) {}
@@ -231,24 +246,33 @@ class AudioQueue {
     this.playing = false;
     this.pump();
   }
-  playUrl(url, text = '', timing = null, turn = '') {
+  playUrl(url, text = '', timing = null, turn = '', reqId = '') {
     // Returns {ok, reason}. Retries once. Never hangs: cancel() settles it
     // via _playResolve, plus a 45s safety timeout.
+    reqId = reqId || turn || '';
     return new Promise((resolve) => {
       if (this.cancelled) return resolve({ ok: false, reason: 'cancelled' });
       this._playResolve = resolve;
       let done = false;
       const settle = (v) => { if (!done) { done = true; this._playResolve = null; resolve(v); } };
-      const timer = setTimeout(() => settle({ ok: false, reason: 'playback timeout' }), 45000);
+      const timer = setTimeout(() => {
+        this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=AUDIO_PLAYBACK error=playback timeout`);
+        settle({ ok: false, reason: 'playback timeout' });
+      }, 45000);
       const a = new Audio(url);
       a.muted = this.muted;
       this.currentAudio = a;
       a.onended = () => { clearTimeout(timer); settle({ ok: true }); };
-      a.onerror = () => { clearTimeout(timer); settle({ ok: false, reason: 'audio decode error' }); };
+      a.onerror = () => {
+        clearTimeout(timer);
+        this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=AUDIO_PLAYBACK error=audio decode error`);
+        settle({ ok: false, reason: 'audio decode error' });
+      };
       let started = false;
       const triggerStart = () => {
         if (!started) {
           started = true;
+          this._log(`[AUDIO req_id=${reqId || 'n/a'}] audio playback started for: "${text.slice(0, 40)}"`);
           try { text && this.onSentenceStart && this.onSentenceStart(text); } catch (e) {}
         }
       };
@@ -266,6 +290,7 @@ class AudioQueue {
           } else {
             triggerStart();
             clearTimeout(timer);
+            this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=AUDIO_PLAYBACK error=${reason}`);
             settle({ ok: false, reason });
           }
         });
@@ -273,9 +298,10 @@ class AudioQueue {
       attempt(0);
     });
   }
-  _playStream(text, tReq, turn) {
+  _playStream(text, tReq, turn, reqId = '') {
     // Progressive first-phrase playback: the element streams /api/tts/stream and
     // starts on the first frames. Barge-in cancels it by dropping src + load().
+    reqId = reqId || turn || '';
     return new Promise((resolve) => {
       if (this.cancelled) return resolve({ ok: false, reason: 'cancelled' });
       this._playResolve = resolve;
@@ -284,7 +310,11 @@ class AudioQueue {
       // 20s: a suspended/background tab defers media start — surfacing that as
       // a failure quickly is better than a 45s dead wait, and the caller retries
       // through the download path
-      const timer = setTimeout(() => { this._stopStream(); settle({ ok: false, reason: 'playback timeout' }); }, 20000);
+      const timer = setTimeout(() => {
+        this._stopStream();
+        this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_STREAM error=playback timeout`);
+        settle({ ok: false, reason: 'playback timeout' });
+      }, 20000);
       const a = new Audio();
       a.muted = this.muted;
       this.currentAudio = a;
@@ -293,20 +323,25 @@ class AudioQueue {
       const onData = () => {
         if (dataAt) return;
         dataAt = performance.now();
-        this._log('first audio frames ready ' + ((dataAt - tReq) / 1000).toFixed(2) + 's after TTS request');
+        this._log(`[TTS req_id=${reqId || 'n/a'}] first audio frames ready ` + ((dataAt - tReq) / 1000).toFixed(2) + 's after TTS request');
       };
       a.onprogress = onData;
       a.onloadedmetadata = onData;
       a.onplaying = () => {
         if (started) return;
         started = true;
+        this._log(`[AUDIO req_id=${reqId || 'n/a'}] audio playback started for: "${text.slice(0, 40)}"`);
         try { this.onSentenceStart && this.onSentenceStart(text); } catch (e) {}
         // dataAt stays null when the browser never reported progress — report
         // n/a rather than a fake 0ms
         this._reportFirstAudio(dataAt || null, tReq, true, turn);
       };
       a.onended = () => { clearTimeout(timer); settle({ ok: true }); };
-      a.onerror = () => { clearTimeout(timer); settle({ ok: false, reason: 'tts stream failed' }); };
+      a.onerror = () => {
+        clearTimeout(timer);
+        this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_STREAM error=tts stream failed`);
+        settle({ ok: false, reason: 'tts stream failed' });
+      };
       const eng = encodeURIComponent(this.engine || 'fish');
       a.src = '/api/tts/stream?voice=' + encodeURIComponent(this.fishVoice || '') +
               '&engine=' + eng +
@@ -314,7 +349,12 @@ class AudioQueue {
       const attempt = (n) => {
         a.play().catch((e) => {
           if (n < 1 && !this.cancelled) setTimeout(() => attempt(n + 1), 200);
-          else { clearTimeout(timer); settle({ ok: false, reason: (e && e.name) || 'play rejected' }); }
+          else {
+            clearTimeout(timer);
+            const reason = (e && e.name) || 'play rejected';
+            this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_STREAM error=${reason}`);
+            settle({ ok: false, reason });
+          }
         });
       };
       attempt(0);
@@ -391,6 +431,9 @@ class AudioQueue {
       }
       this._pcmRecvSec += buf.duration;
       this.playing = true;
+      if (!this._pcmTurn || this._pcmTurn !== turn) {
+        this._log(`[AUDIO req_id=${turn || 'n/a'}] live audio playback started`);
+      }
       try { this.onSpeaking && this.onSpeaking(); } catch (e) {}
 
       if (this._expectFirst) {

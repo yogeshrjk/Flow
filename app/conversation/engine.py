@@ -126,6 +126,15 @@ def strip_emotion_tags(text: str) -> str:
     return t
 
 
+def sanitize_error(err_str: str) -> str:
+    """Sanitize error messages to ensure no API keys or Bearer tokens are logged or returned."""
+    import re as _re
+    s = str(err_str or "")
+    s = _re.sub(r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", s, flags=_re.IGNORECASE)
+    s = _re.sub(r"(key|token|secret|authorization)=['\"][^'\"]+['\"]", r"\1=[REDACTED]", s, flags=_re.IGNORECASE)
+    return s[:300]
+
+
 def memory_hint_for(profile: dict, s: "Session") -> str:
     bits = []
     g = profile.get("grammar", {}) or {}
@@ -358,10 +367,13 @@ class Engine:
         return f"Hey! I'm {pname}. How's your day going?"
 
     async def handle_gemini_live_turn(self, s: Session, text: str, send, t_turn0: float,
-                                       t_speech_end_ms: float | None = None, turn_id: str = ""):
+                                       t_speech_end_ms: float | None = None, turn_id: str = "",
+                                       req_id: str = ""):
         """Stream turn using Google's official Gemini Live BidiGenerateContent WebSocket."""
+        req_id = req_id or turn_id or s.id
+        log.info(f"[CHAT req_id={req_id}] chat handler entered (gemini_live) sid={s.id} text={text[:80]!r}")
         s.cancelled = False
-        await send({"type": "status", "state": "THINKING"})
+        await send({"type": "status", "state": "THINKING", "req_id": req_id})
         t_llm0 = time.time()
 
         profile = load_profile(settings.data_dir, s.user_id)
@@ -430,20 +442,24 @@ class Engine:
                 return
             if not first_token:
                 first_token = True
-                await send({"type": "tts_start_hint"})
-                await send({"type": "status", "state": "SPEAKING"})
-            await send({"type": "llm_token", "token": tok})
+                log.info(f"[LLM req_id={req_id}] LLM response first token received (gemini_live)")
+                await send({"type": "tts_start_hint", "req_id": req_id, "turn": turn_id})
+                await send({"type": "status", "state": "SPEAKING", "req_id": req_id})
+            await send({"type": "llm_token", "token": tok, "req_id": req_id, "turn": turn_id})
 
         async def on_pcm_audio(pcm_b64, mime):
             nonlocal first_token, live_audio_n
             live_audio_n += 1
+            if live_audio_n == 1:
+                log.info(f"[AUDIO req_id={req_id}] live audio stream started")
             if s.cancelled:
                 return
             await send({
                 "type": "live_audio_chunk",
                 "data": pcm_b64,
                 "mime": mime,
-                "turn": turn_id
+                "turn": turn_id,
+                "req_id": req_id
             })
 
         # setup + streaming share ONE guarded region: any failure anywhere
@@ -470,6 +486,7 @@ class Engine:
                                             scenario=s.scenario, challenge="", memory_hint=mem,
                                             language=s.language, persona_name=pname, persona_gender=pgender)
                     live_sess = GeminiLiveSession(voice_name=voice_name)
+                    log.info(f"[LLM req_id={req_id}] LLM request started (Gemini Live Bidi) voice={voice_name}")
                     await live_sess.connect(system_instruction=sys_inst)
                     s._live_session = live_sess
 
@@ -490,10 +507,11 @@ class Engine:
                 if not full_reply and live_parts:
                     full_reply = "".join(live_parts)
                 if s.cancelled:
-                    await send({"type": "llm_cancelled"})
+                    await send({"type": "llm_cancelled", "req_id": req_id, "turn": turn_id})
                     return
                 s.history.append({"role": "assistant", "content": full_reply})
                 s.turns.append({"role": "assistant", "text": full_reply, "t": time.time()})
+                log.info(f"[LLM req_id={req_id}] LLM response received tokens={len(live_parts)} audio_chunks={live_audio_n}")
                 await send({
                     "type": "llm_done",
                     "text": full_reply,
@@ -501,9 +519,11 @@ class Engine:
                     "live": True,
                     "correction": [{"kind": m.kind, "hint": m.correction_hint} for m in to_correct],
                     "level": s.level,
-                    "confidence": conf
+                    "confidence": conf,
+                    "req_id": req_id,
+                    "turn": turn_id
                 })
-                await send({"type": "status", "state": "LISTENING"})
+                await send({"type": "status", "state": "LISTENING", "req_id": req_id})
                 return  # success — leave the attempt loop, never run the turn twice
         except asyncio.CancelledError:
             # Interrupted mid-turn (real user barge-in OR a stray mic-noise trigger).
@@ -528,7 +548,9 @@ class Engine:
                     "partial": True,
                     "correction": [{"kind": m.kind, "hint": m.correction_hint} for m in to_correct],
                     "level": s.level,
-                    "confidence": conf
+                    "confidence": conf,
+                    "req_id": req_id,
+                    "turn": turn_id
                 })
             else:
                 log.info("[GEMINI LIVE] turn interrupted during setup with zero output — graceful fallback")
@@ -537,12 +559,13 @@ class Engine:
                 s.turns.append({"role": "assistant", "text": fb, "t": time.time()})
                 await send({"type": "llm_done", "text": fb, "live": True,
                             "partial": True, "correction": [], "level": s.level,
-                            "confidence": conf})
-            await send({"type": "status", "state": "LISTENING"})
+                            "confidence": conf, "req_id": req_id, "turn": turn_id})
+            await send({"type": "status", "state": "LISTENING", "req_id": req_id})
             raise
         except Exception as e:
-            log.error(f"[GEMINI LIVE] turn failed: {e}")
-            await send({"type": "error", "scope": "gemini_live", "message": str(e)[:300]})
+            err_msg = sanitize_error(str(e))
+            log.error(f"[ERROR req_id={req_id}] stage=GEMINI_LIVE error={err_msg}")
+            await send({"type": "error", "scope": "gemini_live", "stage": "GEMINI_LIVE", "message": err_msg, "req_id": req_id, "turn": turn_id})
             partial = "".join(live_parts).strip()
             if partial:
                 # Died with words already out (e.g. turn timeout): keep them.
@@ -557,29 +580,34 @@ class Engine:
                     "partial": True,
                     "correction": [{"kind": m.kind, "hint": m.correction_hint} for m in to_correct],
                     "level": s.level,
-                    "confidence": conf
+                    "confidence": conf,
+                    "req_id": req_id,
+                    "turn": turn_id
                 })
             else:
                 fb = "Sorry, I had a little hiccup. Could you say that again?"
-                await send({"type": "llm_done", "text": fb, "correction": [], "level": s.level, "confidence": conf})
-            await send({"type": "status", "state": "LISTENING"})
+                await send({"type": "llm_done", "text": fb, "display_text": fb, "correction": [], "level": s.level, "confidence": conf, "req_id": req_id, "turn": turn_id})
+            await send({"type": "status", "state": "LISTENING", "req_id": req_id})
 
     async def handle_user_turn(self, s: Session, text: str, send, t_turn0: float,
-                               t_speech_end_ms: float | None = None, turn_id: str = ""):
+                               t_speech_end_ms: float | None = None, turn_id: str = "",
+                               req_id: str = ""):
         """Stream LLM reply token-by-token via send() callback. Supports barge-in cancel."""
         text = (text or "").strip()
         if not text:
-            await send({"type": "status", "state": "LISTENING", "note": "empty transcript ignored"})
+            await send({"type": "status", "state": "LISTENING", "note": "empty transcript ignored", "req_id": req_id})
             return
 
         want_mode = (getattr(s, "response_mode", "") or settings.default_response_mode or "").lower()
         if want_mode in ("gemini_live", "live"):
-            return await self.handle_gemini_live_turn(s, text, send, t_turn0, t_speech_end_ms, turn_id)
+            return await self.handle_gemini_live_turn(s, text, send, t_turn0, t_speech_end_ms, turn_id, req_id=req_id)
 
+        req_id = req_id or turn_id or s.id
+        log.info(f"[CHAT req_id={req_id}] chat handler entered sid={s.id} mode={want_mode} text={text[:80]!r}")
         log.info(f"[TURN] user sid={s.id} chars={len(text)} text={text[:120]!r}")
         log.info(f"[STT] final chars={len(text)}")
         s.cancelled = False
-        await send({"type": "status", "state": "THINKING"})
+        await send({"type": "status", "state": "THINKING", "req_id": req_id, "turn": turn_id})
         t_llm0 = time.time()
 
         profile = load_profile(settings.data_dir, s.user_id)
@@ -604,6 +632,7 @@ class Engine:
 
         llm = self.llm_for(s)
         want_label = (s.response_mode or settings.default_response_mode or "fast")
+        log.info(f"[LLM req_id={req_id}] LLM request started provider={getattr(llm, 'name', '?')} model={getattr(llm, 'active_model', getattr(llm, 'name', '?'))}")
         full: list[str] = []
         buf = ""
         coalescer = SentenceCoalescer()
@@ -626,7 +655,8 @@ class Engine:
             server latency numbers and tells the client to stream-play it.
             `turn` tags every phrase so the client can drop audio from a turn
             that was interrupted while these messages were in flight."""
-            payload: dict = {"type": "tts_sentence", "text": speech_text, "turn": turn_id}
+            log.info(f"[TTS req_id={req_id}] TTS request started text={speech_text[:50]!r} (first={first})")
+            payload: dict = {"type": "tts_sentence", "text": speech_text, "turn": turn_id, "req_id": req_id}
             if first:
                 payload["first"] = True
                 payload["lat"] = {k: (int(round(v)) if isinstance(v, (int, float)) else v)
@@ -654,31 +684,31 @@ class Engine:
                     log.info(f"[SEARCH] failed, answering from model: {e}")
                     facts = ""
                 if s.cancelled:
-                    await send({"type": "llm_cancelled"})
+                    await send({"type": "llm_cancelled", "req_id": req_id, "turn": turn_id})
                     return
                 if facts:
                     messages = messages + [{"role": "system", "content": facts}]
             # brief human beat before answering — not the old 350ms wall
             await asyncio.sleep(max(0, settings.reply_pause_ms) / 1000)
             if s.cancelled:
-                await send({"type": "llm_cancelled"})
+                await send({"type": "llm_cancelled", "req_id": req_id, "turn": turn_id})
                 return
-            await send({"type": "status", "state": "SPEAKING"})
+            await send({"type": "status", "state": "SPEAKING", "req_id": req_id, "turn": turn_id})
             async for tok in llm.stream(messages, max_tokens=180):
                 if s.cancelled:
-                    log.info("[TURN] cancelled by barge-in")
-                    await send({"type": "llm_cancelled"})
+                    log.info(f"[TURN req_id={req_id}] cancelled by barge-in")
+                    await send({"type": "llm_cancelled", "req_id": req_id, "turn": turn_id})
                     return
                 if not first_token_logged:
                     t_first_token = time.time() - t_llm0
                     lat["llm_ttft_ms"] = t_first_token * 1000
-                    log.info(f"[LLM] first-token latency={t_first_token:.2f}s "
+                    log.info(f"[LLM req_id={req_id}] LLM response first token received t={t_first_token:.2f}s "
                              f"model={getattr(llm,'active_model',getattr(llm,'name','?'))}")
                     first_token_logged = True
-                    await send({"type": "tts_start_hint"})
+                    await send({"type": "tts_start_hint", "req_id": req_id, "turn": turn_id})
                 full.append(tok)
                 buf += tok
-                await send({"type": "llm_token", "token": tok})
+                await send({"type": "llm_token", "token": tok, "req_id": req_id, "turn": turn_id})
                 # fast path: emit the opening clause the moment it is speakable
                 if not first_chunk_done and not coalescer.held:
                     split = first_chunk_split(buf)
@@ -690,7 +720,7 @@ class Engine:
                             await speak_chunk(spoken, True)
                             first_chunk_done = True
                             t_first_chunk = time.time() - t_llm0
-                            log.info(f"[TTS] first chunk fast-path chars={len(spoken)} after={t_first_chunk:.2f}s")
+                            log.info(f"[TTS req_id={req_id}] first chunk fast-path chars={len(spoken)} after={t_first_chunk:.2f}s")
                 sentences, buf = chunk_sentences(buf)
                 for sent in sentences:
                     if s.cancelled:
@@ -703,14 +733,14 @@ class Engine:
                             await speak_chunk(spoken, True)
                             first_chunk_done = True
                             t_first_chunk = time.time() - t_llm0
-                            log.info(f"[TTS] first sentence chars={len(spoken)} after={t_first_chunk:.2f}s")
+                            log.info(f"[TTS req_id={req_id}] first sentence chars={len(spoken)} after={t_first_chunk:.2f}s")
                         continue
                     for chunk in coalescer.feed(sent):
                         spoken = clean_for_speech(chunk)
                         if spoken:
                             await speak_chunk(spoken, not first_chunk_done)
                             first_chunk_done = True
-                    log.info(f"[TTS] sentence queued chars={len(sent)}")
+                    log.info(f"[TTS req_id={req_id}] sentence queued chars={len(sent)}")
             for chunk in coalescer.flush(buf):
                 spoken = clean_for_speech(chunk)
                 if spoken:
@@ -724,23 +754,27 @@ class Engine:
             reply = "".join(full).strip()
             s.history.append({"role": "assistant", "content": reply})
             s.turns.append({"role": "assistant", "text": reply, "t": time.time()})
-            log.info(f"[TURN] done turn_s={time.time()-t_turn0:.2f}s reply_chars={len(reply)}")
+            log.info(f"[LLM req_id={req_id}] LLM response received chars={len(reply)}")
+            log.info(f"[TURN req_id={req_id}] done turn_s={time.time()-t_turn0:.2f}s reply_chars={len(reply)}")
             await send({"type": "llm_done", "text": reply,
                         "display_text": strip_emotion_tags(reply),
                         "correction": [ {"kind": m.kind, "hint": m.correction_hint} for m in to_correct ],
-                        "level": s.level, "confidence": conf})
-            await send({"type": "status", "state": "LISTENING"})
+                        "level": s.level, "confidence": conf,
+                        "req_id": req_id,
+                        "turn": turn_id})
+            await send({"type": "status", "state": "LISTENING", "req_id": req_id, "turn": turn_id})
         except asyncio.CancelledError:
-            log.info("[TURN] task cancelled")
-            await send({"type": "llm_cancelled"})
+            log.info(f"[TURN req_id={req_id}] task cancelled")
+            await send({"type": "llm_cancelled", "req_id": req_id, "turn": turn_id})
             raise
         except Exception as e:
-            log.error(f"[LLM] failed: {e}")
-            await send({"type": "error", "scope": "llm", "message": str(e)[:300]})
+            err_msg = sanitize_error(str(e))
+            log.error(f"[ERROR req_id={req_id}] stage=LLM error={err_msg}")
+            await send({"type": "error", "scope": "llm", "stage": "LLM", "message": err_msg, "req_id": req_id, "turn": turn_id})
             # graceful spoken fallback (still conversational)
             fb = "Sorry, I had a little hiccup. Can you say that again?"
-            await send({"type": "llm_done", "text": fb, "display_text": fb, "correction": [], "level": s.level, "confidence": conf})
-            await send({"type": "status", "state": "LISTENING"})
+            await send({"type": "llm_done", "text": fb, "display_text": fb, "correction": [], "level": s.level, "confidence": conf, "req_id": req_id, "turn": turn_id})
+            await send({"type": "status", "state": "LISTENING", "req_id": req_id, "turn": turn_id})
 
     async def close_live(self, s: Session) -> None:
         """Release the Gemini Live Bidi socket (frees the Google-side session
