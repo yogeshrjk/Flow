@@ -20,7 +20,7 @@ import httpx
 
 log = logging.getLogger("search")
 
-WIKI_UA = "FlowCoachApp/1.0 (English learning assistant; mailto:contact@flowcoach.app)"
+WIKI_UA = "Flow/1.0 (voice chat assistant; mailto:contact@flow.app)"
 WEB_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 

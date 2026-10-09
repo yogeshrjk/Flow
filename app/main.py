@@ -15,6 +15,11 @@ from app.conversation.engine import engine
 from app.coaching.roleplay import SCENARIOS, today_challenge
 from app.coaching.memory import load_profile
 from app.providers.tts.fish import FishProvider
+from app.providers.tts.fish_library import (
+    LANGUAGES as FISH_LIBRARY_LANGUAGES,
+    FishLibraryError,
+    fish_voice_library,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 log = logging.getLogger("app")
@@ -54,7 +59,7 @@ async def api_config():
              "desc": "Ultra-fast voice response (~400ms TTFT) with Groq & Fish Audio.",
              "available": engine.mode_available("groq_fish")},
             {"id": "gemini_fish", "label": "Gemini + Fish Audio",
-             "desc": "Natural intelligence & English coaching with Gemini & Fish Audio.",
+             "desc": "Natural voice conversation with Gemini & Fish Audio.",
              "available": engine.mode_available("gemini_fish")},
             {"id": "gemini_live", "label": "Gemini Live Preview",
              "desc": "Gemini Live voice assistant using gemini-3.8-live model.",
@@ -68,6 +73,9 @@ async def api_config():
             {"id": "hinglish", "label": "Hinglish", "stt": "en-IN"},
         ],
         "fish_voices": FISH_VOICES,
+        "fish_library_languages": [
+            {"id": code, "label": label} for code, label in FISH_LIBRARY_LANGUAGES.items()
+        ],
         "default_fish_voice": DEFAULT_FISH_VOICE,
         "gemini_voices": GEMINI_VOICES,
         "default_gemini_voice": DEFAULT_GEMINI_VOICE,
@@ -77,6 +85,28 @@ async def api_config():
         "modes": ["free", "practice"],
         "scenarios": [{"id": k, **v} for k, v in SCENARIOS.items()],
     }
+
+
+@app.get("/api/voice-library")
+async def voice_library(language: str, page: int = 1, title: str = ""):
+    """Return one cached page of public Fish Audio models for a language."""
+    try:
+        return await fish_voice_library.list_public_models(language, page, title)
+    except FishLibraryError as exc:
+        headers = {"Retry-After": exc.retry_after} if exc.retry_after else None
+        return JSONResponse({"error": exc.message}, status_code=exc.status_code, headers=headers)
+
+
+@app.get("/api/voice-library/validate")
+async def validate_library_voice(voice_id: str):
+    """Verify that a selected library voice is still public before using it."""
+    try:
+        if await fish_voice_library.is_public_model(voice_id):
+            return {"public": True}
+        return JSONResponse({"error": "Voice is not public or is unavailable."}, status_code=404)
+    except FishLibraryError as exc:
+        headers = {"Retry-After": exc.retry_after} if exc.retry_after else None
+        return JSONResponse({"error": exc.message}, status_code=exc.status_code, headers=headers)
 
 
 @app.get("/api/challenge/today")
@@ -96,6 +126,18 @@ class TTSReq(BaseModel):
 
 
 from app.voices import FISH_VOICES, DEFAULT_FISH_VOICE, GEMINI_VOICES, DEFAULT_GEMINI_VOICE
+
+
+async def fish_voice_validation_error(voice_id: str):
+    if not voice_id or voice_id in {voice["id"] for voice in FISH_VOICES}:
+        return None
+    try:
+        if await fish_voice_library.is_public_model(voice_id):
+            return None
+    except FishLibraryError as exc:
+        headers = {"Retry-After": exc.retry_after} if exc.retry_after else None
+        return JSONResponse({"error": exc.message}, status_code=exc.status_code, headers=headers)
+    return JSONResponse({"error": "unknown or non-public voice"}, status_code=400)
 
 
 @app.post("/api/tts")
@@ -120,8 +162,9 @@ async def tts(req: TTSReq):
             return Response(content=audio, media_type="audio/wav")
         return JSONResponse({"error": err or "gemini live audio failed"}, status_code=402)
 
-    if vid and vid not in {v["id"] for v in FISH_VOICES}:
-        return JSONResponse({"error": "unknown voice"}, status_code=400)
+    voice_error = await fish_voice_validation_error(vid or "")
+    if voice_error:
+        return voice_error
     from app.providers.tts.fish import FishProvider
     audio, err = await FishProvider().synthesize(text, voice_id=vid)
     if audio:
@@ -146,8 +189,9 @@ async def tts_stream(text: str = "", voice: str = "", engine: str = ""):
     if is_gemini_voice:
         return await tts(TTSReq(text=txt, voice=vid or "", engine="gemini"))
 
-    if vid and vid not in {v["id"] for v in FISH_VOICES}:
-        return JSONResponse({"error": "unknown voice"}, status_code=400)
+    voice_error = await fish_voice_validation_error(vid or "")
+    if voice_error:
+        return voice_error
     it, err = await FishProvider().open_stream(txt, voice_id=vid)
     if it is None:
         return JSONResponse({"error": err or "fish failed"}, status_code=402)
@@ -165,8 +209,9 @@ async def tts_test(voice: str = "", engine: str = ""):
     is_gemini = (engine == "gemini") or (vid in {v["id"] for v in GEMINI_VOICES})
     if is_gemini:
         return await tts(TTSReq(text="Hello! This is a Gemini Live voice test. How do I sound?", voice=vid, engine="gemini"))
-    if vid and vid not in {v["id"] for v in FISH_VOICES}:
-        return JSONResponse({"error": "unknown voice"}, status_code=400)
+    voice_error = await fish_voice_validation_error(vid or "")
+    if voice_error:
+        return voice_error
     return await tts(TTSReq(text="Hey! This is a Fish Audio voice test. How do I sound?", voice=vid, engine="fish"))
 
 
@@ -258,10 +303,17 @@ async def ws_session(ws: WebSocket, sid: str, lang: str = ""):
                 vid = str(msg.get("value", ""))
                 from app.voices import FISH_VOICES, GEMINI_VOICES, persona_for
                 valid_ids = {v["id"] for v in FISH_VOICES} | {v["id"] for v in GEMINI_VOICES}
-                if vid in valid_ids:
+                try:
+                    valid = vid in valid_ids or await fish_voice_library.is_public_model(vid)
+                except FishLibraryError as exc:
+                    await send({"type": "voice_error", "error": exc.message, "value": vid})
+                    continue
+                if valid:
                     s.voice_id = vid
                     pname, pgender = persona_for(vid)
                     await send({"type": "voice", "value": vid, "persona": pname})
+                else:
+                    await send({"type": "voice_error", "error": "Voice is not public or is unavailable.", "value": vid})
             elif mtype == "sync_history":
                 turns = msg.get("turns") or []
                 if isinstance(turns, list) and turns:

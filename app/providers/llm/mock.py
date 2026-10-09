@@ -1,4 +1,4 @@
-"""Offline mock LLM (free, unlimited). Natural partner + delayed passive coaching.
+"""Offline mock LLM (free, unlimited). Natural voice-chat replies for demo mode.
 Used when GEMINI_API_KEY is empty so the app runs with zero cost.
 Also used in tests."""
 import asyncio

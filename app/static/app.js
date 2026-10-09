@@ -18,6 +18,12 @@ let lastSentText = '', lastSentAt = 0;
 // AI Response mode (friendly labels only — the provider behind them is server-side)
 let respModes = [], respMode = 'fast', respModeLabel = 'Fast Response';
 let turnSeq = 0;
+const fishLibraryStates = new Map();
+let fishLibraryLanguage = 'en', fishLibrarySearchTimer = null;
+let fishLibraryRequestToken = 0, fishLibraryPreview = null, fishLibraryPreviewButton = null;
+let fishLibraryTab = 'explore';
+const fishLibraryFilters = { gender: '', age: '', tags: [], qualities: [] };
+const FISH_BOOKMARKS_KEY = 'flow_fish_voice_bookmarks_v1';
 const icons = () => { try { window.lucide && lucide.createIcons(); } catch (e) {} };
 
 // --- [VOICE LATENCY]: the number the user actually feels -------------------
@@ -60,7 +66,13 @@ function renderResponseModes(cfg) {
   const note = $('respNote');
   if (note) {
     const un = respModes.filter(m => m.available === false).map(m => m.label);
-    note.textContent = un.length ? un.join(' + ') + ' is unavailable right now — the other option is used instead.' : '';
+    if (un.length) {
+      note.textContent = un.join(' + ') + ' is unavailable right now — the other option is used instead.';
+      note.classList.remove('hidden');
+    } else {
+      note.textContent = '';
+      note.classList.add('hidden');
+    }
   }
 }
 function labelFor(id) {
@@ -97,13 +109,45 @@ function updateVoiceDropdown() {
     v.appendChild(o);
   });
 
-  let pick = defaultVoice;
+  let saved = '';
   try {
-    const saved = localStorage.getItem(storageKey);
-    if (saved && voices.some(x => x.id === saved)) pick = saved;
+    saved = localStorage.getItem(storageKey) || '';
   } catch (e) {}
+  const customFishVoice = !isGeminiLive && saved && !voices.some(x => x.id === saved);
+  let customFishName = '';
+  if (customFishVoice) {
+    try { customFishName = localStorage.getItem('fishVoiceName') || 'Public voice'; }
+    catch (e) { customFishName = 'Public voice'; }
+    const option = document.createElement('option');
+    option.value = saved;
+    option.textContent = customFishName;
+    v.appendChild(option);
+  }
+  const pick = saved && (customFishVoice || voices.some(x => x.id === saved)) ? saved : defaultVoice;
   if (pick) v.value = pick;
-  audioQ.fishVoice = v.value || '';
+  audioQ.fishVoice = customFishVoice ? saved : (v.value || '');
+  const selectedName = $('selectedVoiceName');
+  if (selectedName) {
+    if (customFishVoice) {
+      selectedName.textContent = customFishName;
+    } else {
+      const option = [...v.options].find(x => x.value === audioQ.fishVoice);
+      selectedName.textContent = option ? option.textContent : 'Browse the Fish Audio library';
+    }
+  }
+
+  const geminiVoiceFld = $('geminiVoiceFld');
+  const voicePickerOpen = $('voicePickerOpen');
+  if (geminiVoiceFld) {
+    geminiVoiceFld.classList.toggle('hidden', !isGeminiLive);
+  }
+  if (voicePickerOpen) {
+    voicePickerOpen.classList.toggle('hidden', isGeminiLive);
+  }
+  if (isGeminiLive && typeof voiceLibraryState !== 'undefined' && voiceLibraryState.isOpen) {
+    closeVoicePicker();
+  }
+  icons();
 
   const fs = $('fishStatus');
   if (fs) {
@@ -591,6 +635,602 @@ function updateModeUI() {
   }
 }
 
+function fishLibraryKey(language, title) {
+  return language + '\n' + title.trim().toLocaleLowerCase();
+}
+function fishLibraryState(language, title) {
+  const key = fishLibraryKey(language, title);
+  if (!fishLibraryStates.has(key)) {
+    fishLibraryStates.set(key, {
+      language, title: title.trim(), pages: [], total: 0, hasMore: true,
+      windowLimited: false, loadingPage: 0, error: '', errorPage: 0,
+      pending: new Map()
+    });
+  }
+  return fishLibraryStates.get(key);
+}
+function getFishBookmarks() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FISH_BOOKMARKS_KEY) || '[]');
+    return Array.isArray(saved) ? saved.filter(voice => voice && typeof voice.id === 'string') : [];
+  } catch (error) {
+    return [];
+  }
+}
+function saveFishBookmarks(bookmarks) {
+  try {
+    localStorage.setItem(FISH_BOOKMARKS_KEY, JSON.stringify(bookmarks));
+    return true;
+  } catch (error) {
+    $('fishLibraryNote').textContent = 'Could not save bookmarks in this browser.';
+    log('[FISH LIBRARY] bookmark save failed:', error && error.name || error);
+    return false;
+  }
+}
+function defaultFishVoices() {
+  return (serverConfig && serverConfig.fish_voices || []).map(voice => {
+    const gender = voice.gender || '';
+    const label = gender ? `${gender[0].toUpperCase()}${gender.slice(1)}` : 'AI';
+    return {
+      id: voice.id,
+      name: voice.label,
+      description: voice.description || `${label} voice preset.`,
+      languages: [],
+      tags: voice.tags || (gender ? [label, 'Built-in'] : ['Built-in']),
+      creator: {},
+      samples: [],
+      isDefault: true
+    };
+  });
+}
+const FISH_VOICE_AGES = [
+  ['Child', /\b(child|kid|children)\b/i],
+  ['Teen', /\b(teen|teenager|adolescent)\b/i],
+  ['Young', /\byoung\b/i],
+  ['Adult', /\badult\b/i],
+  ['Middle-aged', /\bmiddle[\s-]+aged\b/i],
+  ['Mature', /\bmature\b/i],
+  ['Older', /\bolder|senior\b/i],
+  ['Elderly', /\belderly\b/i]
+];
+const FISH_VOICE_QUALITIES = [
+  'Warm', 'Bright', 'Deep', 'Soft', 'Clear', 'Expressive', 'Energetic',
+  'Calm', 'Smooth', 'Raspy', 'Breathy', 'Playful', 'Natural', 'Friendly',
+  'Confident', 'Soothing', 'Professional', 'Conversational', 'Storytelling'
+];
+function fishVoiceText(voice) {
+  return [voice.name, voice.description, ...(voice.tags || [])].filter(Boolean).join(' ');
+}
+function fishVoiceGender(voice) {
+  const text = fishVoiceText(voice);
+  if (/\b(female|woman|women|girl|feminine)\b/i.test(text)) return 'female';
+  if (/\b(male|man|men|boy|masculine)\b/i.test(text)) return 'male';
+  return '';
+}
+function fishVoiceAge(voice) {
+  const text = fishVoiceText(voice);
+  const match = FISH_VOICE_AGES.find(([, pattern]) => pattern.test(text));
+  return match ? match[0] : '';
+}
+function fishVoiceQualities(voice) {
+  const text = fishVoiceText(voice);
+  return FISH_VOICE_QUALITIES.filter(quality =>
+    new RegExp(`\\b${quality.toLocaleLowerCase()}\\b`, 'i').test(text)
+  );
+}
+function fishLibraryLoadedVoices(state) {
+  const seen = new Set();
+  const voices = [];
+  state.pages.forEach(page => (page && page.voices || []).forEach(voice => {
+    if (voice.id && !seen.has(voice.id)) {
+      seen.add(voice.id);
+      voices.push(voice);
+    }
+  }));
+  return voices;
+}
+function renderVoiceFilterOptions(containerId, values, selectedValues, onChange, emptyText) {
+  const container = $(containerId);
+  container.replaceChildren();
+  if (!values.length) {
+    const empty = document.createElement('span');
+    empty.className = 'voice-filter-empty';
+    empty.textContent = emptyText;
+    container.appendChild(empty);
+    return;
+  }
+  values.forEach(value => {
+    const label = document.createElement('label');
+    label.className = 'voice-filter-option';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = value;
+    input.checked = selectedValues.includes(value);
+    input.onchange = () => onChange(value, input.checked);
+    const text = document.createElement('span');
+    text.textContent = value;
+    label.append(input, text);
+    container.appendChild(label);
+  });
+}
+function updateFishVoiceFilterOptions(voices) {
+  const genders = [...new Set(voices.map(fishVoiceGender).filter(Boolean))].sort();
+  const genderSelect = $('voiceFilterGender');
+  const selectedGender = fishLibraryFilters.gender;
+  genderSelect.replaceChildren(new Option('Any gender', ''));
+  genders.forEach(gender => genderSelect.add(new Option(
+    `${gender[0].toUpperCase()}${gender.slice(1)} (${voices.filter(voice => fishVoiceGender(voice) === gender).length})`,
+    gender
+  )));
+  genderSelect.value = genders.includes(selectedGender) ? selectedGender : '';
+  fishLibraryFilters.gender = genderSelect.value;
+  $('voiceFilterGenderNote').textContent = genders.length ? '' : 'No explicit gender labels among loaded voices.';
+  $('voiceFilterGenderNote').classList.toggle('hidden', !!genders.length);
+
+  const ages = [...new Set(voices.map(fishVoiceAge).filter(Boolean))]
+    .sort((a, b) => FISH_VOICE_AGES.findIndex(([age]) => age === a) - FISH_VOICE_AGES.findIndex(([age]) => age === b));
+  const ageSelect = $('voiceFilterAge');
+  const selectedAge = fishLibraryFilters.age;
+  ageSelect.replaceChildren(new Option('Any age', ''));
+  ages.forEach(age => ageSelect.add(new Option(age, age)));
+  ageSelect.value = ages.includes(selectedAge) ? selectedAge : '';
+  fishLibraryFilters.age = ageSelect.value;
+  $('voiceFilterAgeNote').textContent = ages.length ? '' : 'No explicit age labels among loaded voices.';
+  $('voiceFilterAgeNote').classList.toggle('hidden', !!ages.length);
+
+  const tags = [...new Set(voices.flatMap(voice => voice.tags || [])
+    .map(tag => String(tag).trim())
+    .filter(tag => tag && !['public', 'default'].includes(tag.toLocaleLowerCase())))].sort((a, b) => a.localeCompare(b));
+  renderVoiceFilterOptions('voiceFilterTags', tags, fishLibraryFilters.tags, (tag, checked) => {
+    fishLibraryFilters.tags = checked
+      ? [...fishLibraryFilters.tags, tag]
+      : fishLibraryFilters.tags.filter(item => item !== tag);
+    renderFishLibrary();
+  }, 'No tags are available on loaded voices.');
+
+  const qualities = [...new Set(voices.flatMap(fishVoiceQualities))].sort((a, b) => a.localeCompare(b));
+  renderVoiceFilterOptions('voiceFilterQualities', qualities, fishLibraryFilters.qualities, (quality, checked) => {
+    fishLibraryFilters.qualities = checked
+      ? [...fishLibraryFilters.qualities, quality]
+      : fishLibraryFilters.qualities.filter(item => item !== quality);
+    renderFishLibrary();
+  }, 'No voice-quality labels are available on loaded voices.');
+}
+function activeFishVoiceFilterCount() {
+  return (fishLibraryFilters.gender ? 1 : 0) + (fishLibraryFilters.age ? 1 : 0) +
+    fishLibraryFilters.tags.length + fishLibraryFilters.qualities.length;
+}
+function setVoiceFilterOpen(open) {
+  const overlay = $('voiceFilterOverlay');
+  overlay.classList.toggle('hidden', !open);
+  $('voiceFilterOpen').setAttribute('aria-expanded', String(open));
+  if (open) setTimeout(() => $('voiceFilterGender').focus(), 0);
+  else $('voiceFilterOpen').focus();
+}
+function resetFishVoiceFilters() {
+  fishLibraryFilters.gender = '';
+  fishLibraryFilters.age = '';
+  fishLibraryFilters.tags = [];
+  fishLibraryFilters.qualities = [];
+  renderFishLibrary();
+}
+function setFishLibraryTab(tab) {
+  fishLibraryTab = tab;
+  if (tab !== 'explore' && !$('voiceFilterOverlay').classList.contains('hidden')) {
+    $('voiceFilterOverlay').classList.add('hidden');
+    $('voiceFilterOpen').setAttribute('aria-expanded', 'false');
+  }
+  const tabs = [
+    ['explore', 'voiceTabExplore'],
+    ['default', 'voiceTabDefault'],
+    ['bookmarked', 'voiceTabBookmarked']
+  ];
+  tabs.forEach(([name, id]) => {
+    const button = $(id);
+    const active = name === tab;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+  const languageField = $('fishLibraryLanguage').closest('.fld');
+  languageField.classList.toggle('hidden', tab === 'default');
+  $('voiceFilterOpen').classList.toggle('hidden', tab !== 'explore');
+  const more = $('fishLibraryMore'), retry = $('fishLibraryRetry');
+  more.classList.toggle('hidden', tab !== 'explore');
+  retry.classList.toggle('hidden', tab !== 'explore');
+  if (tab === 'explore') {
+    const state = fishLibraryState(fishLibraryLanguage, $('fishLibrarySearch').value || '');
+    if (!state.pages.length && !state.loadingPage && !state.error) {
+      loadFishLibraryPage(state.language, state.title, 1);
+      return;
+    }
+  }
+  renderFishLibrary();
+}
+function renderFishLibrary() {
+  const title = $('fishLibrarySearch').value || '';
+  const state = fishLibraryState(fishLibraryLanguage, title);
+  const grid = $('fishLibraryGrid'), note = $('fishLibraryNote');
+  const more = $('fishLibraryMore'), retry = $('fishLibraryRetry');
+  let voices = [];
+  if (fishLibraryTab === 'default') {
+    voices = defaultFishVoices();
+  } else if (fishLibraryTab === 'bookmarked') {
+    voices = getFishBookmarks();
+  } else {
+    voices = fishLibraryLoadedVoices(state);
+  }
+  if (fishLibraryTab === 'explore') updateFishVoiceFilterOptions(voices);
+  const query = title.trim().toLocaleLowerCase();
+  const filtered = voices.filter((voice) => {
+    const matchesQuery = !query || (voice.name || '').toLocaleLowerCase().includes(query);
+    const matchesLanguage = fishLibraryTab === 'default' || !voice.languages?.length ||
+      voice.languages.includes(fishLibraryLanguage);
+    const gender = fishVoiceGender(voice);
+    const age = fishVoiceAge(voice);
+    const tags = (voice.tags || []).map(tag => String(tag).trim());
+    const qualities = fishVoiceQualities(voice);
+    const matchesFilters = fishLibraryTab !== 'explore' ||
+      (!fishLibraryFilters.gender || gender === fishLibraryFilters.gender) &&
+      (!fishLibraryFilters.age || age === fishLibraryFilters.age) &&
+      fishLibraryFilters.tags.every(tag => tags.includes(tag)) &&
+      fishLibraryFilters.qualities.every(quality => qualities.includes(quality));
+    return matchesQuery && matchesLanguage && matchesFilters;
+  });
+  grid.replaceChildren();
+  if (fishLibraryPreviewButton && !fishLibraryPreviewButton.isConnected) {
+    stopFishLibraryPreview();
+  }
+  filtered.forEach((voice) => grid.appendChild(makeFishLibraryCard(voice)));
+  icons();
+  more.classList.toggle('hidden', fishLibraryTab !== 'explore' || !state.hasMore || !!state.error);
+  more.disabled = fishLibraryTab === 'explore' && !!state.loadingPage;
+  more.textContent = state.loadingPage ? 'Loading…' : 'Load more';
+  retry.classList.toggle('hidden', fishLibraryTab !== 'explore' || !state.error);
+  const filterCount = activeFishVoiceFilterCount();
+  $('voiceFilterCount').textContent = String(filterCount);
+  $('voiceFilterCount').classList.toggle('hidden', !filterCount);
+  if (fishLibraryTab === 'default') {
+    note.textContent = `${filtered.length} built-in ${filtered.length === 1 ? 'voice' : 'voices'}.`;
+  } else if (fishLibraryTab === 'bookmarked') {
+    note.textContent = filtered.length
+      ? `${filtered.length} bookmarked ${filtered.length === 1 ? 'voice' : 'voices'}.`
+      : 'Your bookmarked voices will appear here.';
+  } else if (state.loadingPage && !voices.length) {
+    note.textContent = 'Loading public voices…';
+  } else if (state.error) {
+    note.textContent = state.error;
+  } else if (!filtered.length && state.pages.length) {
+    note.textContent = 'No public voices found for this language and search.';
+  } else if (state.windowLimited) {
+    note.textContent = `Loaded ${voices.length} of ${state.total.toLocaleString()} public results. Fish Audio marks this catalogue window as limited, so additional public voices may not be accessible through this endpoint.`;
+  } else if (voices.length && state.hasMore) {
+    note.textContent = `Loaded ${voices.length} of ${state.total.toLocaleString()} public results.`;
+  } else if (voices.length) {
+    note.textContent = `Showing ${voices.length} public ${voices.length === 1 ? 'voice' : 'voices'}.`;
+  } else {
+    note.textContent = state.loadingPage ? 'Loading public voices…' : 'Choose a language to browse public voices.';
+  }
+}
+function makeFishLibraryCard(voice) {
+  const card = document.createElement('article');
+  card.className = 'voice-library-card';
+  const content = document.createElement('div');
+  content.className = 'voice-library-content';
+  
+  const sample = (voice.samples || []).find((item) => item.audio);
+  const isBookmarked = getFishBookmarks().some(bookmark => bookmark.id === voice.id);
+  
+  const previewBtn = document.createElement('button');
+  previewBtn.type = 'button';
+  previewBtn.className = 'voice-library-preview-avatar';
+  previewBtn.title = 'Preview voice';
+  previewBtn.setAttribute('aria-label', 'Preview voice');
+  previewBtn.innerHTML = '<i data-lucide="play"></i>';
+  previewBtn.disabled = !sample && !voice.isDefault;
+  previewBtn.onclick = () => toggleFishLibraryPreview(voice, sample, previewBtn);
+  content.appendChild(previewBtn);
+  
+  const info = document.createElement('div');
+  info.className = 'voice-library-info';
+  const head = document.createElement('div');
+  head.className = 'voice-library-title';
+  const name = document.createElement('span');
+  name.textContent = voice.name || 'Unnamed voice';
+  head.appendChild(name);
+  
+  const topActions = document.createElement('div');
+  topActions.className = 'voice-card-top-actions';
+  
+  const use = document.createElement('button');
+  use.type = 'button';
+  use.className = 'voice-use-icon';
+  use.title = 'Use this voice';
+  use.setAttribute('aria-label', 'Use this voice');
+  use.innerHTML = '<i data-lucide="check"></i>';
+  use.onclick = () => useFishLibraryVoice(voice, use);
+  
+  const bookmark = document.createElement('button');
+  bookmark.type = 'button';
+  bookmark.className = 'voice-bookmark-icon';
+  bookmark.title = isBookmarked ? 'Remove bookmark' : 'Bookmark voice';
+  bookmark.setAttribute('aria-label', bookmark.title);
+  bookmark.setAttribute('aria-pressed', String(isBookmarked));
+  bookmark.innerHTML = `<i data-lucide="${isBookmarked ? 'bookmark-check' : 'bookmark'}"></i>`;
+  bookmark.onclick = () => toggleFishVoiceBookmark(voice);
+  
+  topActions.append(use, bookmark);
+  head.appendChild(topActions);
+  info.appendChild(head);
+
+  if (voice.description) {
+    const description = document.createElement('p');
+    description.className = 'voice-library-description';
+    description.textContent = voice.description;
+    description.title = voice.description;
+    info.appendChild(description);
+  }
+  const metadata = [];
+  if (voice.languages && voice.languages.length) metadata.push('Languages: ' + voice.languages.join(', '));
+  if (voice.creator && voice.creator.name) metadata.push('By ' + voice.creator.name);
+  if (metadata.length) {
+    const details = document.createElement('div');
+    details.className = 'voice-library-meta';
+    details.textContent = metadata.join(' · ');
+    details.title = metadata.join(' · ');
+    info.appendChild(details);
+  }
+  content.appendChild(info);
+  card.appendChild(content);
+  const visibleTags = (voice.tags || []).filter(tag =>
+    !['public', 'default'].includes(String(tag).trim().toLocaleLowerCase())
+  );
+  if (visibleTags.length) {
+    const tags = document.createElement('div');
+    tags.className = 'voice-library-tags';
+    tags.title = visibleTags.join(', ');
+    visibleTags.slice(0, 3).forEach((tag) => {
+      const chip = document.createElement('span');
+      chip.className = 'voice-library-tag';
+      chip.textContent = tag;
+      tags.appendChild(chip);
+    });
+    if (visibleTags.length > 3) {
+      const extra = document.createElement('span');
+      extra.className = 'voice-library-tag voice-library-tag-extra';
+      extra.textContent = `+${visibleTags.length - 3}`;
+      tags.appendChild(extra);
+    }
+    card.appendChild(tags);
+  }
+  return card;
+}
+async function toggleFishLibraryPreview(voice, sample, button) {
+  if (fishLibraryPreview && fishLibraryPreviewButton === button) {
+    if (fishLibraryPreview.paused) {
+      try {
+        await fishLibraryPreview.play();
+        setFishPreviewButton(button, true);
+      } catch (error) {
+        log('[FISH LIBRARY] preview resume failed:', error && error.name || error);
+      }
+    } else {
+      fishLibraryPreview.pause();
+      setFishPreviewButton(button, false);
+    }
+    return;
+  }
+  stopFishLibraryPreview();
+  try {
+    let source = sample?.audio || '';
+    let objectUrl = '';
+    if (voice.isDefault) {
+      const params = new URLSearchParams({ voice: voice.id, engine: 'fish' });
+      const response = await fetch('/api/tts/test?' + params.toString());
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Voice preview failed (${response.status}).`);
+      }
+      objectUrl = URL.createObjectURL(await response.blob());
+      source = objectUrl;
+    }
+    const audio = new Audio(source);
+    fishLibraryPreview = audio;
+    fishLibraryPreviewButton = button;
+    button.classList.add('playing');
+    setFishPreviewButton(button, true);
+    audio.onended = () => stopFishLibraryPreview();
+    audio.onerror = () => stopFishLibraryPreview();
+    audio.onpause = () => {
+      if (fishLibraryPreview === audio && !audio.ended) setFishPreviewButton(button, false);
+    };
+    audio.onplay = () => setFishPreviewButton(button, true);
+    audio.__flowObjectUrl = objectUrl;
+    await audio.play();
+  } catch (error) {
+    stopFishLibraryPreview();
+    $('fishLibraryNote').textContent = error && error.message
+      ? error.message : 'Preview playback failed. Check audio playback permissions.';
+    log('[FISH LIBRARY] preview failed:', error && error.name || error);
+  }
+}
+function setFishPreviewButton(button, playing) {
+  if (!button) return;
+  button.innerHTML = `<i data-lucide="${playing ? 'pause' : 'play'}"></i>`;
+  button.classList.toggle('playing', playing);
+  button.title = playing ? 'Pause preview' : 'Preview voice';
+  button.setAttribute('aria-label', button.title);
+  icons();
+}
+function stopFishLibraryPreview() {
+  const audio = fishLibraryPreview;
+  const button = fishLibraryPreviewButton;
+  fishLibraryPreview = null;
+  fishLibraryPreviewButton = null;
+  if (audio) {
+    audio.onended = null;
+    audio.onerror = null;
+    audio.onpause = null;
+    audio.onplay = null;
+    audio.pause();
+    if (audio.__flowObjectUrl) URL.revokeObjectURL(audio.__flowObjectUrl);
+  }
+  if (button) {
+    button.classList.remove('playing');
+    setFishPreviewButton(button, false);
+  }
+}
+function toggleFishVoiceBookmark(voice) {
+  const bookmarks = getFishBookmarks();
+  const existing = bookmarks.findIndex(item => item.id === voice.id);
+  if (existing >= 0) bookmarks.splice(existing, 1);
+  else bookmarks.unshift({
+    id: voice.id,
+    name: voice.name || 'Unnamed voice',
+    description: voice.description || '',
+    languages: Array.isArray(voice.languages) ? voice.languages : [],
+    tags: Array.isArray(voice.tags) ? voice.tags : [],
+    visibility: voice.visibility || 'Public',
+    creator: voice.creator || {},
+    cover_image: voice.cover_image || '',
+    samples: (voice.samples || []).slice(0, 3),
+    isDefault: !!voice.isDefault
+  });
+  if (saveFishBookmarks(bookmarks)) renderFishLibrary();
+}
+async function useFishLibraryVoice(voice, button) {
+  if (!voice || !voice.id) return;
+  button.disabled = true;
+  button.innerHTML = '<i data-lucide="loader-2"></i>';
+  icons();
+  try {
+    if (!voice.isDefault) {
+      const params = new URLSearchParams({ voice_id: voice.id });
+      const response = await fetch('/api/voice-library/validate?' + params.toString());
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `Voice verification failed (${response.status}).`);
+    }
+
+    if (respMode === 'gemini_live') applyResponseMode('gemini_fish', false);
+    audioQ.fishVoice = voice.id;
+    try {
+      localStorage.setItem('fishVoice', voice.id);
+      if (voice.isDefault) localStorage.removeItem('fishVoiceName');
+      else localStorage.setItem('fishVoiceName', voice.name || 'Public voice');
+    } catch (e) {}
+    updateVoiceDropdown();
+    const selectedName = $('selectedVoiceName');
+    if (selectedName) selectedName.textContent = voice.name || 'Public voice';
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'set_voice', value: voice.id }));
+    }
+    log('[TTS] public Fish Audio voice selected:', voice.name || voice.id);
+    closeVoicePicker();
+  } catch (error) {
+    $('fishLibraryNote').textContent = error && error.message
+      ? error.message : 'Could not use this voice. Please try again.';
+    log('[FISH LIBRARY] voice selection failed:', error && error.message || error);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = '<i data-lucide="check"></i>';
+    icons();
+  }
+}
+async function loadFishLibraryPage(language, title, pageNumber, retry = false) {
+  const state = fishLibraryState(language, title);
+  if (!retry && state.pages[pageNumber - 1]) return;
+  if (state.pending.has(pageNumber)) return state.pending.get(pageNumber);
+  const token = ++fishLibraryRequestToken;
+  state.loadingPage = pageNumber;
+  state.error = '';
+  state.errorPage = 0;
+  renderFishLibrary();
+  const request = (async () => {
+    try {
+      const params = new URLSearchParams({ language, page: String(pageNumber) });
+      if (title.trim()) params.set('title', title.trim());
+      const response = await fetch('/api/voice-library?' + params.toString());
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const retryAfter = response.headers.get('Retry-After');
+        const waitNote = response.status === 429 && retryAfter ? ` Retry after ${retryAfter} seconds.` : '';
+        throw new Error((body.error || `Voice library request failed (${response.status}).`) + waitNote);
+      }
+      const oldIds = new Set(state.pages.flatMap((entry) => entry && entry.voices || []).map((item) => item.id));
+      const unique = (body.voices || []).filter((item) => item && item.id && !oldIds.has(item.id));
+      state.pages[pageNumber - 1] = { ...body, voices: unique };
+      state.total = Number.isFinite(body.total) ? body.total : unique.length;
+      state.hasMore = !!body.has_more;
+      state.windowLimited = state.windowLimited || !!body.window_limited;
+      log('[FISH LIBRARY] loaded', unique.length, language, 'voices, page', pageNumber);
+    } catch (error) {
+      state.error = error && error.message ? error.message : 'Could not load public voices.';
+      state.errorPage = pageNumber;
+      log('[FISH LIBRARY] request failed:', state.error);
+    } finally {
+      state.loadingPage = 0;
+      state.pending.delete(pageNumber);
+      if (token === fishLibraryRequestToken || fishLibraryLanguage === language) renderFishLibrary();
+    }
+  })();
+  state.pending.set(pageNumber, request);
+  return request;
+}
+function initializeFishLibrary(languages) {
+  const select = $('fishLibraryLanguage');
+  if (!select) return;
+  select.replaceChildren();
+  (languages || []).forEach((language) => {
+    const option = document.createElement('option');
+    option.value = language.id;
+    option.textContent = language.label;
+    select.appendChild(option);
+  });
+  fishLibraryLanguage = select.value || 'en';
+  select.onchange = () => {
+    fishLibraryLanguage = select.value;
+    renderFishLibrary();
+    if (fishLibraryTab !== 'explore') return;
+    const state = fishLibraryState(fishLibraryLanguage, $('fishLibrarySearch').value || '');
+    if (!state.pages.length && !state.loadingPage) loadFishLibraryPage(state.language, state.title, 1);
+  };
+  $('fishLibrarySearch').oninput = () => {
+    clearTimeout(fishLibrarySearchTimer);
+    renderFishLibrary();
+    fishLibrarySearchTimer = setTimeout(() => {
+      if (fishLibraryTab !== 'explore') return;
+      const state = fishLibraryState(fishLibraryLanguage, $('fishLibrarySearch').value || '');
+      if (!state.pages.length && !state.loadingPage) loadFishLibraryPage(state.language, state.title, 1);
+    }, 350);
+  };
+  $('voiceTabExplore').onclick = () => setFishLibraryTab('explore');
+  $('voiceTabDefault').onclick = () => setFishLibraryTab('default');
+  $('voiceTabBookmarked').onclick = () => setFishLibraryTab('bookmarked');
+  $('fishLibraryMore').onclick = () => {
+    const state = fishLibraryState(fishLibraryLanguage, $('fishLibrarySearch').value || '');
+    if (!state.loadingPage) loadFishLibraryPage(state.language, state.title, state.pages.length + 1);
+  };
+  $('fishLibraryRetry').onclick = () => {
+    const state = fishLibraryState(fishLibraryLanguage, $('fishLibrarySearch').value || '');
+    if (state.errorPage) loadFishLibraryPage(state.language, state.title, state.errorPage, true);
+  };
+  $('voiceFilterOpen').onclick = () => setVoiceFilterOpen($('voiceFilterOverlay').classList.contains('hidden'));
+  $('voiceFilterClose').onclick = () => setVoiceFilterOpen(false);
+  $('voiceFilterDone').onclick = () => setVoiceFilterOpen(false);
+  $('voiceFilterOverlay').onclick = event => {
+    if (event.target === $('voiceFilterOverlay')) setVoiceFilterOpen(false);
+  };
+  $('voiceFilterGender').onchange = () => {
+    fishLibraryFilters.gender = $('voiceFilterGender').value;
+    renderFishLibrary();
+  };
+  $('voiceFilterAge').onchange = () => {
+    fishLibraryFilters.age = $('voiceFilterAge').value;
+    renderFishLibrary();
+  };
+  $('voiceFilterReset').onclick = resetFishVoiceFilters;
+  renderFishLibrary();
+}
+
 async function loadConfig() {
   try {
     const cfg = await (await fetch('/api/config')).json();
@@ -624,6 +1264,7 @@ async function loadConfig() {
 
     renderResponseModes(cfg);
     updateVoiceDropdown();
+    initializeFishLibrary(cfg.fish_library_languages || []);
   } catch (e) {
     const fs = $('fishStatus');
     if (fs) fs.textContent = 'Server unreachable — is it running on :8000?';
@@ -775,7 +1416,11 @@ async function connect() {
       }
       log('[MODE]', m.mode);
     }
-    else if (m.type === 'summary') { showSummary(m); }
+    else if (m.type === 'voice_error') {
+      const status = $('fishStatus');
+      if (status) status.textContent = m.error || 'The selected voice could not be used.';
+      log('[TTS] voice selection rejected:', m.error || m.value);
+    }
     else if (m.type === 'error') {
       hideTypingIndicator();
       log(`[${m.scope}] error:`, m.message);
@@ -802,17 +1447,6 @@ document.addEventListener('DOMContentLoaded', () => {
   icons();
   if ($('clearChatBtn')) $('clearChatBtn').onclick = clearChatHistory;
 });
-
-function showSummary(s) {
-  $('feedback').textContent =
-`Duration ${s.duration_min} min · ${s.words_spoken} words · ${s.turns} turns
-Fluency ${s.fluency} · Grammar ${s.grammar} · Vocab ${s.vocabulary}
-Improve: ${s.main_improvement}
-Try: "${s.useful_phrase}"
-Pronunciation: ${s.pronunciation_focus}
-Next: ${s.next_goal}`;
-  if (s.spoken_feedback) audioQ.enqueue(s.spoken_feedback);
-}
 
 function normText(s) {
   return (s || '')
@@ -1034,6 +1668,52 @@ function selectedMicDevice() {
     return v || '';
   } catch (e) { return ''; }
 }
+function pauseRecognitionForMicTest() {
+  if (!running || !listening || micMuted || !recog) return Promise.resolve(() => {});
+  const current = recog;
+  const originalOnEnd = current.onend;
+  listening = false;
+  clearTimeout(recogRestartTimer);
+  let finish;
+  const ended = new Promise((resolve) => {
+    let done = false;
+    const complete = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(complete, 750);
+    finish = complete;
+    current.onend = (event) => {
+      try { originalOnEnd && originalOnEnd.call(current, event); }
+      finally { complete(); }
+    };
+  });
+  try { current.stop(); } catch (e) { finish(); }
+  return ended.then(() => {
+    if (current.onend !== originalOnEnd) current.onend = originalOnEnd;
+    return () => {
+      if (running && !micMuted && recog === current && !recogFatal) {
+        listening = true;
+        try { current.start(); }
+        catch (e) { log('[STT] restart after mic test failed:', e); }
+      }
+    };
+  });
+}
+function micTestErrorMessage(error) {
+  const name = (error && error.name) || String(error || 'unknown error');
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return 'Mic access requires HTTPS (or localhost). Open Flow using a secure URL.';
+  }
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return 'Microphone permission is blocked. Allow it for this site in browser settings, then reload Flow.';
+  }
+  if (name === 'NotFoundError') return 'No microphone was found on this device.';
+  if (name === 'NotReadableError') return 'The microphone is busy or unavailable. Close other apps using it and try again.';
+  return 'Mic test failed: ' + name;
+}
 
 function bargeIn() {
   audioQ.cancel();
@@ -1070,7 +1750,6 @@ async function startSession() {
   setIcon($('startBtn'), 'square');
   $('startBtn').classList.add('live');
   $('interruptBtn').disabled = false;
-  $('endBtn').disabled = false;
   setState('LISTENING');
   startClock();
 
@@ -1226,14 +1905,6 @@ $('anim').onchange = (e) => {
   try { window.Orb && Orb.setStyle(e.target.value); } catch (err) {}
   log('[UI] animation →', e.target.value);
 };
-$('voice').onchange = (e) => {
-  audioQ.fishVoice = e.target.value || '';
-  const storageKey = (audioQ.engine === 'gemini') ? 'geminiVoice' : 'fishVoice';
-  try { localStorage.setItem(storageKey, audioQ.fishVoice); } catch (err) {}
-  try { ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'set_voice', value: audioQ.fishVoice })); } catch (err) {}
-  const label = e.target.selectedOptions[0] ? e.target.selectedOptions[0].textContent : e.target.value;
-  log(`[TTS] ${audioQ.engine === 'gemini' ? 'Gemini Live' : 'Fish Audio'} voice →`, label);
-};
 $('micDevice').onchange = (e) => {
   try { localStorage.setItem('micDevice', e.target.value || ''); } catch (err) {}
   log('[VAD] microphone →', e.target.selectedOptions[0] ? e.target.selectedOptions[0].textContent : e.target.value);
@@ -1243,10 +1914,16 @@ $('micTestBtn').onclick = async () => {
   const st = $('micTestStatus');
   st.textContent = 'Listening for 2.5s — speak now…';
   let stream = null, ctx = null;
+  let resumeRecognition = () => {};
   try {
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new DOMException('Microphone access requires a secure context.', 'NotAllowedError');
+    }
+    resumeRecognition = await pauseRecognitionForMicTest();
     const dev = selectedMicDevice();
-    stream = await navigator.mediaDevices.getUserMedia({ audio: dev ? { deviceId: { exact: dev } } : true });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: dev ? { deviceId: { ideal: dev } } : true });
     ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') await ctx.resume();
     const src = ctx.createMediaStreamSource(stream);
     const an = ctx.createAnalyser();
     an.fftSize = 1024;
@@ -1270,22 +1947,25 @@ $('micTestBtn').onclick = async () => {
     st.textContent = verdict;
     log('[VAD] mic test peak:', pct + '% —', verdict);
   } catch (e) {
-    st.textContent = 'Mic test failed: ' + ((e && e.name) || e);
+    st.textContent = micTestErrorMessage(e);
     log('[VAD] mic test failed:', (e && e.name) || e);
   } finally {
     try { stream && stream.getTracks().forEach(t => t.stop()); } catch (e) {}
     try { ctx && ctx.close(); } catch (e) {}
+    resumeRecognition();
   }
 };
 function closeDrawers() {
   $('panel').classList.add('hidden');
   $('history').classList.add('hidden');
   $('scrim').classList.add('hidden');
+  $('settingsBtn').classList.remove('hidden');
 }
 function openPanel(o) {
   if (o) $('history').classList.add('hidden');
   $('panel').classList.toggle('hidden', !o);
   $('scrim').classList.toggle('hidden', !o);
+  $('settingsBtn').classList.toggle('hidden', o);
   icons();
 }
 function openHistory(o) {
@@ -1302,13 +1982,64 @@ function openHistory(o) {
   }
   icons();
 }
-$('settingsBtn').onclick = () => openPanel(true);
+function openVoicePicker() {
+  const picker = $('voicePicker');
+  if (!picker) return;
+  picker.classList.remove('hidden');
+  document.body.classList.add('voice-picker-open');
+  if (fishLibraryTab === 'explore') {
+    const state = fishLibraryState(fishLibraryLanguage, $('fishLibrarySearch').value || '');
+    if (!state.pages.length && !state.loadingPage && !state.error) {
+      loadFishLibraryPage(state.language, state.title, 1);
+    }
+  }
+  setTimeout(() => $('fishLibrarySearch').focus(), 0);
+  icons();
+}
+function closeVoicePicker() {
+  const picker = $('voicePicker');
+  if (!picker || picker.classList.contains('hidden')) return;
+  $('voiceFilterOverlay').classList.add('hidden');
+  $('voiceFilterOpen').setAttribute('aria-expanded', 'false');
+  picker.classList.add('hidden');
+  document.body.classList.remove('voice-picker-open');
+  stopFishLibraryPreview();
+  $('voicePickerOpen').focus();
+}
+$('settingsBtn').onclick = () => {
+  openPanel(true);
+};
+$('voicePickerOpen').onclick = openVoicePicker;
+$('voicePickerClose').onclick = closeVoicePicker;
+$('voicePicker').onclick = (event) => {
+  if (event.target === $('voicePicker')) closeVoicePicker();
+};
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('voiceFilterOverlay').classList.contains('hidden')) {
+    setVoiceFilterOpen(false);
+  } else if (event.key === 'Escape') {
+    closeVoicePicker();
+  }
+});
 $('panelClose').onclick = () => openPanel(false);
 $('historyBtn').onclick = () => {
   // icon toggles the history drawer both ways
   openHistory($('history').classList.contains('hidden'));
 };
 $('scrim').onclick = closeDrawers;
+$('voice').onchange = (e) => {
+  audioQ.fishVoice = e.target.value || '';
+  const storageKey = (audioQ.engine === 'gemini') ? 'geminiVoice' : 'fishVoice';
+  try { localStorage.setItem(storageKey, audioQ.fishVoice); } catch (err) {}
+  if (storageKey === 'fishVoice') {
+    try { localStorage.removeItem('fishVoiceName'); } catch (err) {}
+  }
+  try { ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'set_voice', value: audioQ.fishVoice })); } catch (err) {}
+  const label = e.target.selectedOptions[0] ? e.target.selectedOptions[0].textContent : e.target.value;
+  const selectedName = $('selectedVoiceName');
+  if (selectedName) selectedName.textContent = label;
+  log(`[TTS] ${audioQ.engine === 'gemini' ? 'Gemini Live' : 'Fish Audio'} voice →`, label);
+};
 $('fishTestBtn').onclick = async () => {
   await audioQ.unlock();
   const isGemini = (audioQ.engine === 'gemini');
@@ -1324,8 +2055,7 @@ $('fishTestBtn').onclick = async () => {
       const res = await audioQ.playUrl(url);
       try { URL.revokeObjectURL(url); } catch (e) {}
       if (res.ok) {
-        const label = ($('voice').selectedOptions && $('voice').selectedOptions[0])
-          ? $('voice').selectedOptions[0].textContent : 'Voice';
+        const label = $('selectedVoiceName') ? $('selectedVoiceName').textContent : 'Voice';
         $('fishStatus').textContent = (isGemini ? 'Gemini Live OK — playing ' : 'Fish OK — playing ') + label + '.';
         log('[TTS] voice test OK:', label);
       } else {
@@ -1339,10 +2069,4 @@ $('fishTestBtn').onclick = async () => {
       log('[TTS] voice test:', msg);
     }
   } catch (e) { $('fishStatus').textContent = 'Test error: ' + e; }
-};
-$('endBtn').onclick = () => ws && ws.send(JSON.stringify({ type: 'end' }));
-$('challengeBtn').onclick = async () => {
-  const c = await (await fetch('/api/challenge/today')).json();
-  addTurn('Partner', `Today's challenge: ${c.prompt}`);
-  setAiLine(c.prompt);
 };

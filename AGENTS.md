@@ -1,12 +1,13 @@
-# AGENTS.md — Flow (English Speaking Partner)
+# AGENTS.md — Flow (Voice Chat App)
 
 > **RULE ZERO (always obey): after every code change, update this file.**
 > Add a line to `Changelog`, and update any section this change touched
 > (Gotchas, UI map, API, Tests). A change is not done until this file says it.
 
 ## What this is
-Realtime AI English speaking partner + spoken-English coach. Voice-first,
-single-server, zero-build frontend. Default mode: free conversation + passive coaching.
+Flow is a voice-first chat app: a realtime AI conversation experience for spoken
+interaction, with a single-server, zero-build frontend. Default mode: free
+conversation with optional light feedback when relevant.
 
 ## Stack
 - Backend: Python + FastAPI (`app/main.py`), serves API + static UI. No frontend build.
@@ -85,8 +86,9 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   sentence only) → `hearNote`. Wave canvas `#orb` is the fullscreen
   background (`position:fixed inset:0 100vw/100vh`, behind content, clicks pass
   through); no glow-circle primitives, no white core thread — ribbons only.
-- Bottom-left `#historyBtn` (`.histbtn` fixed at 30px/24px, always visible —
-  never hidden while drawer open) → left drawer `#history`: transparent,
+- `#historyBtn` and `#settingsBtn` stay at the bottom corners on desktop and move
+  to the top corners on mobile (safe-area aware); the history button remains
+  visible while its drawer is open → left drawer `#history`: transparent,
   headerless, full `transcript` (whole replies at turn-end, never streamed;
   full-width wrap, bottom-anchored, empty-state hint, no word/turn stats).
 - Bottom: text `inputpill` with `#userLine` right above it, 5-button icon dock:
@@ -105,12 +107,38 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   language (`#language`: english/hindi/hinglish), microphone (`#micDevice`
   picker from `enumerateDevices`, persisted, passed as `deviceId` to VAD
   `getUserMedia`; `#micTestBtn` standalone 2.5s capture test with peak readout
-  in `#micTestStatus`; STT lifecycle (`onaudiostart`/`onaudioend`/extended error
-  names) logged so mic failures are visible, never silent), voice (`#voice` picker:
-  Flow default, Modi, Trump, Osho, Pragyesh, Sarah, Natasha, Hindi (native
-  accent — pick it when language=hindi); choice in
-  localStorage, sent per TTS request) + `fishTestBtn`/`fishStatus`, challenge,
-  `endBtn`, `feedback` (blue accent card), debug log.
+  in `#micTestStatus` (uses an ideal device constraint, pauses active speech
+  recognition, and explains secure-context/permission errors); STT lifecycle
+  (`onaudiostart`/`onaudioend`/extended error names) logged so mic failures are
+  visible, never silent), voice controls: when "Gemini Live Preview" is active,
+  `#geminiVoiceFld` renders the native Gemini voice dropdown (`#voice`); for
+  Groq and Gemini + Fish Audio modes, `#geminiVoiceFld` is hidden and
+  `#voicePickerOpen` ("Choose a public voice") is shown, opening a centered
+  `#voicePicker` modal with blurred backdrop and Explore / Default Voices /
+  Bookmarked tabs; modal title, tabs, language/search controls, and status stay
+  fixed while only the voice grid scrolls. Explore shows compact content-sized
+  voice cards (three per desktop row) and a Filters popup over the picker;
+  the avatar position contains a circular play/preview button, and the Use
+  and Bookmark action buttons reside in the top-right corner of the title row,
+  revealing on hover for pointer devices and remaining accessible on touch devices;
+  descriptions are clamped to two lines with an ellipsis so controls remain in
+  view. Default voice cards include a gender-based description and Male/Female
+  plus Built-in tags from the configured preset metadata. Cards provide
+  interactive preview play/pause avatar, top-right Use icon, and icon-only
+  bookmark toggle (bookmarks persist in localStorage), with no `public` or
+  `default` badges/tags; selected ID/name persist in localStorage and
+  `set_voice`, with `fishTestBtn`/`fishStatus`, challenge, `endBtn`, `feedback`
+  (blue accent card), debug log.
+- The Fish Audio library is lazy-loaded only when the voice picker opens.
+  `/api/voice-library` proxies authenticated, paginated `GET
+  https://api.fish.audio/model` requests using `language`, `page_size`,
+  `page_number`, `self=false`, and optional `title`; it returns public models
+  only, normalized metadata, and safe HTTPS sample URLs. `/api/voice-library/validate`
+  and TTS/WS voice changes verify a selected ID with Fish's `GET /model/{id}`
+  endpoint before use. Browser cache is keyed by language and title; backend
+  caches each page and verified public ID for five minutes. The UI exposes
+  English, Hindi, Japanese, Chinese, Spanish, French, German, Portuguese,
+  Korean, and Arabic filters.
 - Center text: `aiLine` gray (`#8f97a8`) with KEY WORDS white (`.ailine .hl`):
   the LLM wraps 1-3 key words per reply in `**double asterisks**` (prompt rule
   in prompts.py), client `emphasize()` renders them as `<span class="hl">`;
@@ -193,8 +221,28 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
    names out of it (test `test_public_config_never_leaks_provider_names` enforces
    groq/gemini/llama/openai/… never appear). Internal names are fine in `/health`
    and server logs.
+15. Public Fish voices selected from the library must be rechecked against
+   `GET /model/{id}` and `visibility == "public"` before WebSocket selection or
+   TTS use; never accept arbitrary browser-provided voice IDs.
+15. Mobile mic capture requires a secure origin (HTTPS or localhost). The manual
+   mic test pauses active Web Speech recognition first, uses a preferred rather
+   than exact saved device ID, and gives a site-permission explanation for
+   `NotAllowedError`; it cannot override a permission denied by the browser or OS.
+16. Fish Audio `GET /model` documents public listing (`self=false`) and page
+   controls up to 100 records per page; response `window_limited`,
+   `max_offset`, and total fields must be preserved. Live verification returned
+   public English and Hindi voices on pages 1 and 2 from creators different
+   from the zero-result `self=true` owned-model query, but also set
+   `window_limited=true` with an accessible total of 1,000. Never describe this
+   endpoint as the complete public catalogue.
 
 ## Tests
+- Mobile mic permission flow and top-corner controls: manually verify in a
+  secure-origin mobile browser, including a denied permission and an active
+  speech-recognition session.
+- `tests/test_fish_library.py` — public visibility filtering, metadata mapping,
+  English/Hindi pagination parameters, page and model-verification caches,
+  empty results, and upstream rate-limit/network errors.
 - `tests/test_correction.py` — correction policy (passive/balanced/active).
 - `tests/test_engine.py` — chunker, `SentenceCoalescer` merge, first-chunk fast
   path, marker stripping, level smoothing, §43 transcript.
@@ -207,6 +255,26 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   mp3, playback start, barge-in cancel (manual, open `/static/latency.html`).
 
 ## Changelog (newest first — RULE ZERO: append here on every change)
+- 2026-10-09: Fixed voice preview button icon not switching to pause when audio is playing: `setFishPreviewButton()` was using `button.querySelector('i')` to update the `data-lucide` attribute, but after `icons()` (which calls `lucide.createIcons()`) runs, the `<i>` element is replaced by an `<svg>`, so `querySelector('i')` returns `null` on subsequent calls. Fixed by replacing `button.innerHTML` with a fresh `<i data-lucide="...">` element (same pattern as `setIcon()`) before calling `icons()`; bumped `app.js?v=87` to `v=88`.
+- 2026-10-09: Verified voice preview button already toggles correctly between play/pause icons via `setFishPreviewButton()` (play→pause on click, pause→play on click); set bookmarked voice icon background to white (`background:#fff` on `.voice-bookmark-icon[aria-pressed="true"]`) with dark icon color for contrast; bumped `styles.css?v=74` to `v=75`.
+- 2026-10-09: Fixed gap/whitespace after the Gemini Live selector in the AI Response section: removed blank lines between sections in `index.html` panelbody, and hid the empty `#respNote` (`.pnote`) when no unavailable modes exist by toggling `.hidden` in `app.js` `renderResponseModes()` (the `flex-basis:100%` was forcing a full empty line); bumped `styles.css?v=73` to `v=74` and `app.js?v=86` to `v=87`.
+- 2026-10-09: Fixed gap between AI Response and Experience sections in the settings panel: removed `margin-top:10px` from `.sect` (the `.panelbody` gap already provides spacing between sections); hidden the settings icon (`#settingsBtn`) when the settings panel is open via `openPanel()`/`closeDrawers()` in `app.js`; bumped `styles.css?v=72` to `v=73` and `app.js?v=85` to `v=86`.
+- 2026-10-09: Fixed voice card height in the Fish Audio voice picker: set a fixed `height:140px` on `.voice-library-card` (130px on mobile) so all cards have consistent height and are properly visible regardless of content length; bumped `styles.css?v=71` to `v=72`.
+- 2026-10-09: Fixed voice card responsiveness in the Fish Audio voice picker: replaced the narrow `max-width:380px` / `min-width:641px` media query gap with a proper three-tier responsive grid (`1fr` on mobile ≤480px, `repeat(2,...)` on tablet 481-768px, `repeat(3,...)` on desktop) so cards resize correctly across all screen widths; bumped `styles.css?v=71`.
+- 2026-10-09: Conditionally toggled voice picker button vs Gemini voice select in the settings panel: when "Gemini Live Preview" mode is selected, the "Choose a public voice" button (`#voicePickerOpen`) is hidden and the native Gemini voice dropdown (`#geminiVoiceFld`) is shown; for Groq and Gemini + Fish Audio modes, `#voicePickerOpen` is displayed and `#geminiVoiceFld` is hidden; auto-closes the voice picker modal if open when switching to Gemini Live; bumped `styles.css?v=70` and `app.js?v=85`.
+- 2026-10-09: Made voice card heights responsive to content: removed rigid minimum height constraints (`min-height: 166px` / `154px`) and `grid-auto-rows: minmax(...)` from `.voice-library-grid` and `.voice-library-card`, enabling cards to naturally size based on their title, description, and metadata with `align-items: stretch` across grid rows; bumped `styles.css?v=69` and `app.js?v=84`.
+- 2026-10-09: Redesigned voice cards in `#voicePicker`: converted the card avatar into a circular play/pause preview button with glowing playing state and hover feedback, moved the Use and Bookmark icon buttons to the top-right corner of the card title row (showing on hover/focus on desktop and accessible on touch), and removed obsolete bottom action row; bumped `app.js?v=83` and `styles.css?v=68`.
+- 2026-10-09: Slightly increased minimum voice-card row heights to 166px on desktop and 154px on mobile while retaining content-sized rows; bumped `styles.css?v=67`.
+- 2026-10-09: Replaced fixed-height voice-card rows with compact content-sized rows, tightened card padding and metadata spacing, and preserved hover-only actions on desktop; bumped `styles.css?v=66`.
+- 2026-10-09: Added concise descriptions and gender/Built-in tags to Default Voices cards using the existing preset gender metadata; bumped `app.js?v=82`.
+- 2026-10-09: Restored hover/focus-only voice-card actions on pointer devices while keeping them visible on touch devices; bumped `styles.css?v=65`.
+- 2026-10-09: Applied actual two-line WebKit description clamping with overflow ellipsis in voice cards, preventing long descriptions from crowding Preview/Use controls; bumped `styles.css?v=64`.
+- 2026-10-09: Kept voice-card Preview, Use, and bookmark controls visible at all times instead of hiding them until hover; bumped `styles.css?v=63`.
+- 2026-10-09: Fixed public voice cards to equal-height rows with clamped text/tag overflow; added an overlaid Filters popup beside search for explicitly labelled gender/age and returned tag/voice-quality filters, with reset and active-filter count; bumped `app.js?v=81` and `styles.css?v=62`.
+- 2026-10-09: Fixed the voice picker title, tabs, filters, and status above the scrolling voice-results area; removed Public/Default badges from voice cards; bumped `app.js?v=80` and `styles.css?v=61`.
+- 2026-10-09: Added Explore, Default Voices, and Bookmarked tabs to the centered Fish voice picker; default voices are selectable in the modal, bookmarks persist locally, and voice cards now have icon play/pause, icon Use, and icon-only bookmark controls; removed the separate preset dropdown from Settings; bumped `app.js?v=79` and `styles.css?v=60`.
+- 2026-10-09: Added a language-filtered public Fish Audio voice library in Settings with server-side authentication, paged/cached `/model` requests, name search, public metadata, safe audio previews, retry/empty states, and the upstream catalogue-window limitation; live-verified all ten requested language codes, English/Hindi pagination, previews, and models from other creators; bumped `app.js?v=77` and `styles.css?v=58`.
+- 2026-10-09: Improved mobile mic testing by pausing active speech recognition, using a preferred device ID, resuming recognition afterward, and explaining secure-origin/permission errors; moved chat and settings buttons to safe-area-aware top corners on mobile only; bumped `app.js?v=76` and `styles.css?v=57`.
 - 2026-10-09: Removed the border animation and SVG overlays from the text input box (`.inputpill`), restoring a clean minimal dark pill style with standard focus transition; bumped `styles.css?v=56`.
 - 2026-10-09: Updated top bar status indicator and clock timer to remain hidden when idle and display only during active sessions (`#topbar.hidden` toggled via `startSession()`/`stopSession()`); styled active stop button (`.iconbtn.primary.live`) as a glowing pure white square button with a black stop icon and pulsing white halo ring; bumped `styles.css?v=55` and `app.js?v=75`.
 - 2026-10-09: Set `openai/gpt-oss-20b` as the primary Groq model in `.env` (`GROQ_MODEL=openai/gpt-oss-20b,openai/gpt-oss-120b,qwen/qwen3.8-27b`) and updated `.env.example`; verified streaming completions and latency across live test suite; 58 tests passing.

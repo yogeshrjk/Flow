@@ -1,6 +1,6 @@
-# English Speaking Partner — Realtime AI Spoken-English Coach
+# Flow — Voice Chat App
 
-Voice-first, **free-tier-first** realtime conversation partner. Default mode: **Free Conversation + Passive Coaching** — natural talk first, corrections later, never breaking flow.
+Voice-first, **free-tier-first** realtime conversation app. Default mode: **Free Conversation** — natural talk first, with optional gentle feedback when relevant.
 
 ## 100% free to run
 
@@ -30,6 +30,9 @@ With keys the tiers auto-activate (check `/health`); the in-app picker says only
 
 - **Mic button** → always-listening starts (Web Speech `en-IN` + local VAD). Just speak anytime; talking over the AI interrupts it instantly (350ms sustained-speech gate ignores coughs/fans).
 - Center shows the live line only, over a full-width aurora wave; full history lives in the **left drawer** (top-left icon); **gear** bottom-right holds mode/scenario/correction/level, voice test, challenge, summary.
+- **Voice picker** opens from Settings → Choose a public voice in a centered modal with a blurred backdrop. Its **Explore** tab browses public models by language, search, pagination, and a filters popup (gender/age labels, tags, and voice qualities are derived only when explicitly present in returned voice metadata); **Default Voices** contains the built-in voices with gender-based descriptions and tags; **Bookmarked** contains voices saved locally. Cards feature a circular play/pause preview avatar, top-right Use and icon-only bookmark actions (revealed on hover for desktop and accessible on touch). Fish Audio's documented `/model` endpoint marks public results as window-limited on this account (1,000 accessible records), so the app does not claim to expose the complete public catalogue.
+
+The library follows Fish Audio's official [List Models API](https://docs.fish.audio/api-reference/endpoint/model/list-models), using its documented `language`, `title`, `page_size`, `page_number`, and `self` query parameters. English (`en`), Hindi (`hi`), Japanese (`ja`), Chinese (`zh`), Spanish (`es`), French (`fr`), German (`de`), Portuguese (`pt`), Korean (`ko`), and Arabic (`ar`) were each live-checked against the authenticated endpoint. Results are restricted to records whose returned visibility is `public`; before a selected ID is accepted for a session or TTS request, the server verifies it through Fish Audio's official [Get Model API](https://docs.fish.audio/api-reference/endpoint/model/get-model). The response's `window_limited` flag and accessible-range fields are surfaced because the public catalogue may exceed what Fish makes pageable through this endpoint.
 - Switch **Mode** (free/practice/correction/pronunciation/roleplay/vocab/interview/challenge), **Correction** (passive/balanced/active), **Level** (auto…advanced).
 - **End + summary** → short spoken feedback + detailed card (duration, words, fluency, main improvement, useful phrase, pronunciation focus, next goal).
 
@@ -58,7 +61,9 @@ python scripts/smoke_test.py
 python scripts/latency_probe.py --tiers   # per-tier speech_end → first audio, Fish stream TTFB
 ```
 
-Covers: correction policy, chunker, level smoothing, §43 acceptance transcript, WS
+Tests cover the Fish Audio public voice library API adapter, pagination, cache,
+metadata, public visibility filtering, and rate-limit/error handling in addition
+to correction policy, chunker, level smoothing, §43 acceptance transcript, WS
 greeting + barge-in + summary + response-mode switch, provider tiers and hidden
 naming, Fish streaming + error paths, the `[VOICE LATENCY]` formatter, failure fallbacks.
 
