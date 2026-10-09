@@ -3,6 +3,5 @@ uvicorn[standard]
 httpx
 pydantic
 python-dotenv
-pytest
 websockets
 crawl4ai
