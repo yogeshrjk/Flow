@@ -135,6 +135,10 @@ def memory_hint_for(profile: dict, s: "Session") -> str:
     topics = (profile.get("topics", []) or [])[-3:]
     if topics:
         bits.append(f"they care about: {', '.join(topics)}")
+    if getattr(s, "past_chat_summary", ""):
+        bits.append(f"previous conversations: user mentioned '{s.past_chat_summary}' — feel free to reference this naturally (e.g. 'I remember you mentioned...', 'Last time we discussed...') or ask if they'd like to continue where you left off")
+    elif profile.get("last_chat_summary"):
+        bits.append(f"previous conversations: user mentioned '{profile['last_chat_summary']}' — feel free to reference this naturally")
     if s.hindi_used:
         bits.append("sometimes slips into Hindi — support, don't lecture")
     last_ai = next((t.get("text","") for t in reversed(s.turns) if t.get("role")=="assistant"), "")
@@ -205,6 +209,7 @@ class Session:
     words_spoken: int = 0
     response_mode: str = ""  # "fast" | "quality"; "" = server default
     cancelled: bool = False
+    past_chat_summary: str = ""
 
 
 class Engine:
@@ -236,6 +241,24 @@ class Engine:
         if not self.providers:
             log.info("[LLM] no provider keys — zero-cost demo mode")
         self.llm = self.llm_for(None)
+
+    def sync_past_history(self, s: Session, turns: list[dict]) -> None:
+        """Digest past conversation turns from local storage and update session memory."""
+        if not turns:
+            return
+        user_lines = []
+        for t in turns:
+            c = (t.get("content") or t.get("text") or "").strip()
+            role = t.get("role") or t.get("who") or ""
+            if role.lower() in ("user", "you") and len(c.split()) >= 3:
+                user_lines.append(c)
+        if user_lines:
+            summary = "; ".join(user_lines[-4:])[:300]
+            s.past_chat_summary = summary
+            profile = load_profile(settings.data_dir, s.user_id)
+            profile["last_chat_summary"] = summary
+            save_profile(settings.data_dir, profile)
+            log.info(f"[MEMORY] synced past chat summary for {s.id}: {summary[:100]!r}")
 
     def llm_for(self, s: "Session | None") -> LLMProvider:
         """Pick the provider for a session's chosen response mode, never failing.
@@ -302,6 +325,7 @@ class Engine:
         try:
             from app.conversation.prompts import LANGUAGES
             from app.voices import persona_for
+            from app.coaching.roleplay import SCENARIOS
             profile = load_profile(settings.data_dir, s.user_id)
             mem = memory_hint_for(profile, s)
             pname, pgender = persona_for(s.voice_id or None)
@@ -310,9 +334,15 @@ class Engine:
                                language=s.language,
                                persona_name=pname, persona_gender=pgender)
             lang_name = LANGUAGES.get(s.language, "English")
+            if s.mode == "practice" and s.scenario in SCENARIOS:
+                sc_info = SCENARIOS[s.scenario]
+                sc_title = sc_info.get("title", s.scenario)
+                user_prompt = f"Start our {sc_title} English practice in {lang_name}. Introduce yourself briefly as {pname} in character ({sc_info.get('role', 'interviewer')}) and ask your opening question for {sc_title}. 1-2 natural sentences."
+            else:
+                user_prompt = f"Say a brief warm hello in {lang_name} to start our spoken practice — introduce yourself as {pname} and ask one friendly question to start chatting. One or two sentences, natural spoken speech."
             msgs = [
                 {"role": "system", "content": sys},
-                {"role": "user", "content": f"Say a brief warm hello in {lang_name} to start our spoken practice — introduce yourself as {pname} and ask one friendly question to start chatting. One or two sentences, natural spoken speech."},
+                {"role": "user", "content": user_prompt},
             ]
             out = (await self.llm_for(s).complete(msgs, max_tokens=60)).strip()
             if out:
@@ -321,6 +351,9 @@ class Engine:
                 return out
         except Exception as e:
             log.warning(f"[LLM] greeting failed, fallback: {e}")
+        from app.coaching.roleplay import SCENARIOS
+        if s.mode == "practice" and s.scenario in SCENARIOS:
+            return SCENARIOS[s.scenario].get("opener", f"Hello! Ready for our {s.scenario.replace('_', ' ')} practice?")
         pname, _ = persona_for(s.voice_id or None)
         return f"Hey! I'm {pname}. How's your day going?"
 
@@ -565,11 +598,9 @@ class Engine:
         s.history.append({"role": "user", "content": text})
         s.turns.append({"role": "user", "text": text, "t": time.time()})
 
-        # scenario/challenge context
-        scenario_text = SCENARIOS.get(s.scenario, {}).get("opener", "") if s.mode == "roleplay" else ""
         challenge_text = (s.challenge or {}).get("prompt", "") if s.mode == "challenge" else ""
         ci = corr.correction_instruction(to_correct)
-        messages = self.llm_messages(s, scenario_text, challenge_text, extra_nudge=ci)
+        messages = self.llm_messages(s, challenge_text=challenge_text, extra_nudge=ci)
 
         llm = self.llm_for(s)
         want_label = (s.response_mode or settings.default_response_mode or "fast")

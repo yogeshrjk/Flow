@@ -202,21 +202,86 @@ function hideTypingIndicator() {
   refreshEmptyHint();
 }
 
-function addTurn(who, text) {
+const CHAT_STORAGE_KEY = 'flow_chat_history_v1';
+
+function getStoredChatHistory() {
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveStoredChatHistory(history) {
+  try {
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify((history || []).slice(-40)));
+  } catch (e) {}
+}
+
+function loadChatHistoryUI() {
+  const t = $('transcript');
+  if (!t) return;
+  const history = getStoredChatHistory();
+  t.innerHTML = '';
+  if (history.length > 0) {
+    const divider = document.createElement('div');
+    divider.className = 'history-divider';
+    divider.innerHTML = '<span>Previous Chat</span>';
+    t.appendChild(divider);
+
+    history.forEach(item => {
+      const d = document.createElement('div');
+      d.className = 'turn ' + (item.who === 'You' ? 'you' : 'ai') + ' past';
+      d.textContent = plainText(item.text);
+      t.appendChild(d);
+    });
+    t.scrollTop = t.scrollHeight;
+  }
+  refreshEmptyHint();
+}
+
+function clearChatHistory() {
+  try {
+    localStorage.removeItem(CHAT_STORAGE_KEY);
+  } catch (e) {}
+  const t = $('transcript');
+  if (t) t.innerHTML = '';
+  refreshEmptyHint();
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ type: 'clear_history' })); } catch (e) {}
+  }
+  log('[HISTORY] conversation cleared');
+}
+
+function addTurn(who, text, save = true) {
   hideTypingIndicator();
+  const clean = plainText(text);
+  if (!clean.trim()) return;
+
   const d = document.createElement('div');
   d.className = 'turn ' + (who === 'You' ? 'you' : 'ai');
-  d.textContent = plainText(text);
+  d.textContent = clean;
   const t = $('transcript');
-  t.appendChild(d);
-  if (window.gsap) {
-    gsap.fromTo(d,
-      { opacity: 0, y: 14, filter: 'blur(8px)', scale: 0.98 },
-      { opacity: 1, y: 0, filter: 'blur(0px)', scale: 1, duration: 0.42, ease: 'power2.out' }
-    );
+  if (t) {
+    t.appendChild(d);
+    if (window.gsap) {
+      gsap.fromTo(d,
+        { opacity: 0, y: 14, filter: 'blur(8px)', scale: 0.98 },
+        { opacity: 1, y: 0, filter: 'blur(0px)', scale: 1, duration: 0.42, ease: 'power2.out' }
+      );
+    }
+    t.scrollTop = t.scrollHeight;
   }
-  t.scrollTop = t.scrollHeight;
   refreshEmptyHint();
+
+  if (save) {
+    const hist = getStoredChatHistory();
+    hist.push({ who, text: clean, t: Date.now() });
+    saveStoredChatHistory(hist);
+  }
 }
 // --- aiLine emphasis: **key words** render white, everything else gray ---
 function escHtml(s) {
@@ -534,6 +599,11 @@ async function loadConfig() {
     if (sc) {
       sc.innerHTML = '';
       (cfg.scenarios || []).forEach(s => { const o = document.createElement('option'); o.value = s.id; o.textContent = s.title; sc.appendChild(o); });
+      let savedScenario = '';
+      try { savedScenario = localStorage.getItem('scenario') || ''; } catch (e) {}
+      if (savedScenario && [...sc.options].some(o => o.value === savedScenario)) {
+        sc.value = savedScenario;
+      }
     }
     const av = $('anim');
     if (av) {
@@ -545,6 +615,13 @@ async function loadConfig() {
       $('mode').value = (savedMode === 'practice') ? 'practice' : 'free';
       updateModeUI();
     }
+    let savedCorr = '';
+    try { savedCorr = localStorage.getItem('correction') || ''; } catch (e) {}
+    if ($('correction') && savedCorr) $('correction').value = savedCorr;
+    let savedLevel = '';
+    try { savedLevel = localStorage.getItem('level') || ''; } catch (e) {}
+    if ($('level') && savedLevel) $('level').value = savedLevel;
+
     renderResponseModes(cfg);
     updateVoiceDropdown();
   } catch (e) {
@@ -589,6 +666,26 @@ async function connect() {
       if (saved && STT_LANGS[saved]) {
         $('language').value = saved;
         applyLanguage(saved);
+      }
+    } catch (e) {}
+    // sync current mode, scenario, correction, and level to session
+    try {
+      ws.send(JSON.stringify({
+        type: 'set_mode',
+        mode: $('mode') ? $('mode').value : 'free',
+        scenario: $('scenario') ? $('scenario').value : 'casual'
+      }));
+      ws.send(JSON.stringify({ type: 'set_correction', value: $('correction') ? $('correction').value : 'balanced' }));
+      ws.send(JSON.stringify({ type: 'set_level', value: $('level') ? $('level').value : 'auto' }));
+    } catch (e) {}
+    // sync past chat history memory to session so AI can reference previous discussions
+    try {
+      const past = getStoredChatHistory().slice(-10);
+      if (past.length > 0) {
+        ws.send(JSON.stringify({
+          type: 'sync_history',
+          turns: past.map(x => ({ role: x.who === 'You' ? 'user' : 'assistant', content: x.text }))
+        }));
       }
     } catch (e) {}
     // persona follows the selected voice — sync it so replies match the speaker
@@ -697,7 +794,14 @@ async function connect() {
   }
 }
 
-document.addEventListener('DOMContentLoaded', () => { loadConfig(); loadMicDevices(); initChatSmoke(); icons(); });
+document.addEventListener('DOMContentLoaded', () => {
+  loadConfig();
+  loadMicDevices();
+  loadChatHistoryUI();
+  initChatSmoke();
+  icons();
+  if ($('clearChatBtn')) $('clearChatBtn').onclick = clearChatHistory;
+});
 
 function showSummary(s) {
   $('feedback').textContent =
@@ -758,6 +862,8 @@ function sendText(text) {
   audioQ.turnLat = null;
   ws.send(JSON.stringify({ type: 'user_transcript', text, t0: Date.now(), turn_id: turnId }));
 }
+const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || ('ontouchstart' in window && window.innerWidth < 800);
+
 // fire the turn the moment the user stops talking (VAD end-of-turn), using the
 // latest interim transcript — this is what makes the reply feel instant
 function commitTurnIfReady() {
@@ -779,9 +885,38 @@ function setupRecog() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { hearNote('Speech recognition not supported here — use Chrome, or type below.'); return null; }
   const r = new SR();
-  r.lang = sttLang; r.interimResults = true; r.continuous = true; r.maxAlternatives = 1;
+  r.lang = sttLang;
+  r.interimResults = true;
+  // Mobile browsers (Android Chrome) require single-utterance mode to prevent audio engine stream aborts
+  r.continuous = !isMobile;
+  r.maxAlternatives = 1;
   recogFatal = false;
   clearTimeout(recogRestartTimer);
+
+  r.onspeechstart = () => {
+    if (micMuted || !listening) return;
+    $('micLive').classList.add('on');
+    try { window.__micLevel = 0.08; } catch (e) {}
+    if (aiSpeaking) bargeIn();
+  };
+
+  r.onspeechend = () => {
+    if (micMuted || !listening) return;
+    $('micLive').classList.remove('on');
+    try { window.__micLevel = 0; } catch (e) {}
+  };
+
+  r.onsoundstart = () => {
+    if (micMuted || !listening) return;
+    $('micLive').classList.add('on');
+    try { window.__micLevel = 0.06; } catch (e) {}
+  };
+
+  r.onsoundend = () => {
+    if (micMuted || !listening) return;
+    $('micLive').classList.remove('on');
+    try { window.__micLevel = 0; } catch (e) {}
+  };
 
   r.onresult = (ev) => {
     if (micMuted || !listening) return; // deaf while mic-muted: no turns, no interrupts
@@ -831,7 +966,9 @@ function setupRecog() {
       listening = false;
       hearNote('Mic blocked — allow microphone access, then press mic again.');
     } else if (e.error === 'no-speech') {
-      // transient silence — normal, let onend restart smoothly
+      // transient silence on mobile — normal, onend restarts smoothly
+    } else if (e.error === 'aborted') {
+      // aborted by manual action or turn change
     } else if (e.error === 'network') {
       // transient network interruption with cloud speech service
     } else if (e.error === 'audio-capture') {
@@ -847,11 +984,17 @@ function setupRecog() {
       clearTimeout(recogRestartTimer);
       recogRestartTimer = setTimeout(() => {
         if (listening && running && !recogFatal) {
-          try { r.start(); } catch (e) {
-            setTimeout(() => { if (listening && running && !recogFatal) { try { r.start(); } catch (err) {} } }, 500);
+          try {
+            r.start();
+          } catch (e) {
+            setTimeout(() => {
+              if (listening && running && !recogFatal) {
+                try { r.start(); } catch (err) {}
+              }
+            }, isMobile ? 250 : 500);
           }
         }
-      }, 350);
+      }, isMobile ? 120 : 350);
     }
   };
   return r;
@@ -918,6 +1061,7 @@ async function startSession() {
   running = true;
   await audioQ.unlock();
   await connect();
+  if ($('topbar')) $('topbar').classList.remove('hidden');
   $('chatInput').classList.remove('hidden');
   $('interruptBtn').classList.remove('hidden');
   $('muteBtn').classList.remove('hidden');
@@ -929,20 +1073,27 @@ async function startSession() {
   $('endBtn').disabled = false;
   setState('LISTENING');
   startClock();
-  vad = new EnergyVAD({
-    onSpeechStart: sustainedBargeIn,
-    onSpeechEnd: () => { clearTimeout(speechTimer); commitTurnIfReady(); }
-  });
-  const micOk = await vad.start(selectedMicDevice());
-  if (!micOk) {
-    const why = vad.lastError === 'NotAllowedError' ? 'Mic blocked — allow microphone access in the browser.'
-      : vad.lastError === 'NotFoundError' ? 'No microphone found on this device.'
-      : 'Microphone unavailable (' + (vad.lastError || 'unknown') + '). You can still type below.';
-    hearNote(why, 6000);
-    log('[VAD]', why);
+
+  if (!isMobile) {
+    vad = new EnergyVAD({
+      onSpeechStart: sustainedBargeIn,
+      onSpeechEnd: () => { clearTimeout(speechTimer); commitTurnIfReady(); }
+    });
+    const micOk = await vad.start(selectedMicDevice());
+    if (!micOk) {
+      const why = vad.lastError === 'NotAllowedError' ? 'Mic blocked — allow microphone access in the browser.'
+        : vad.lastError === 'NotFoundError' ? 'No microphone found on this device.'
+        : 'Microphone unavailable (' + (vad.lastError || 'unknown') + '). You can still type below.';
+      hearNote(why, 6000);
+      log('[VAD]', why);
+    } else {
+      loadMicDevices();
+    }
   } else {
+    log('[VAD] mobile mode: native speech recognition handles audio stream');
     loadMicDevices();
   }
+
   recog = setupRecog();
   if (recog) {
     listening = true;
@@ -976,10 +1127,13 @@ function stopSession() {
   clearTimeout(speechTimer);
   try { recog && recog.stop(); } catch (e) {}
   recog = null;
-  try { vad && vad.stop(); } catch (e) {}
-  vad = null;
+  if (vad) {
+    try { vad.stop(); } catch (e) {}
+    vad = null;
+  }
   try { window.__micLevel = 0; } catch (e) {}
   $('micLive').classList.remove('on');
+  if ($('topbar')) $('topbar').classList.add('hidden');
   audioQ.cancel();
   stopClock();
   setIcon($('startBtn'), 'play');
@@ -1039,9 +1193,22 @@ $('mode').onchange = (e) => {
     ws.send(JSON.stringify({ type: 'set_mode', mode: e.target.value, scenario: $('scenario') ? $('scenario').value : '' }));
   }
 };
-$('scenario').onchange = (e) => ws && ws.send(JSON.stringify({ type: 'set_mode', mode: $('mode').value, scenario: e.target.value }));
-$('correction').onchange = (e) => ws && ws.send(JSON.stringify({ type: 'set_correction', value: e.target.value }));
-$('level').onchange = (e) => ws && ws.send(JSON.stringify({ type: 'set_level', value: e.target.value }));
+$('scenario').onchange = (e) => {
+  try { localStorage.setItem('scenario', e.target.value); } catch (err) {}
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'set_mode', mode: $('mode') ? $('mode').value : 'practice', scenario: e.target.value }));
+  }
+  const label = e.target.selectedOptions[0] ? e.target.selectedOptions[0].textContent : e.target.value;
+  log('[SCENARIO] →', label);
+};
+$('correction').onchange = (e) => {
+  try { localStorage.setItem('correction', e.target.value); } catch (err) {}
+  ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'set_correction', value: e.target.value }));
+};
+$('level').onchange = (e) => {
+  try { localStorage.setItem('level', e.target.value); } catch (err) {}
+  ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'set_level', value: e.target.value }));
+};
 const STT_LANGS = { english: 'en-IN', hindi: 'hi-IN', hinglish: 'en-IN' };
 function applyLanguage(v, silent) {
   sttLang = STT_LANGS[v] || 'en-IN';

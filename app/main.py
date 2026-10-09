@@ -262,6 +262,14 @@ async def ws_session(ws: WebSocket, sid: str, lang: str = ""):
                     s.voice_id = vid
                     pname, pgender = persona_for(vid)
                     await send({"type": "voice", "value": vid, "persona": pname})
+            elif mtype == "sync_history":
+                turns = msg.get("turns") or []
+                if isinstance(turns, list) and turns:
+                    engine.sync_past_history(s, turns)
+            elif mtype == "clear_history":
+                s.history.clear()
+                s.turns.clear()
+                s.past_chat_summary = ""
             elif mtype == "end":
                 summary = engine.end_session(s)
                 await send({"type": "summary", **summary})

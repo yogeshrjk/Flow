@@ -739,18 +739,18 @@
   }
 
   const STYLES = {
+    particles: { label: 'Particle Ribbon', render: renderParticles },
     mobius: { label: 'Infinity Möbius', render: renderMobiusStrip },
     ring: { label: 'Infinity Möbius', render: renderMobiusStrip }, // alias for backward compatibility
     aurora: { label: 'Aurora Silk', render: renderAurora },
-    particles: { label: 'Particle Ribbon', render: renderParticles },
     nebula: { label: 'Nebula Drift', render: renderNebula },
   };
-  let styleName = 'mobius';
+  let styleName = 'particles';
   let micSmooth = 0; // exponentially smoothed mic level (see frame())
   try {
     const saved = localStorage.getItem('animStyle');
     if (saved && STYLES[saved]) styleName = saved;
-    else styleName = 'mobius';
+    else styleName = 'particles';
   } catch (e) {}
   function setStyle(n) {
     if (!STYLES[n]) return;

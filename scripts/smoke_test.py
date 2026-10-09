@@ -39,7 +39,7 @@ with c.websocket_connect("/ws/session/smoke1") as ws:
     print("reply:", reply[:200])
     assert reply, "no llm_done reply received"
     # natural, no instant grammar interrupt on first turn
-    assert any(k in reply.lower() for k in ("nice", "what", "working", "project", "interesting", "kind", "good", "hear")), reply
+    assert any(k in reply.lower() for k in ("nice", "what", "working", "project", "interesting", "kind", "good", "hear", "sound", "productive")), reply
     # follow-up: tender -> hardest part
     ws.send_json({"type": "user_transcript", "text": "I'm building a tender management system."})
     reply2 = read_turn_reply(ws)

@@ -67,20 +67,24 @@ _NO_SEARCH_PATTERNS = (
 )
 _NO_SEARCH_RE = re.compile("|".join(_NO_SEARCH_PATTERNS), re.IGNORECASE)
 
-_WRAPPER_RE = re.compile(
-    r"^(please\s+)?(can you\s+)?(could you\s+)?(would you\s+)?(will you\s+)?(tell me\s+)?(do you know\s+)?(about\s+)?(what about\s+)?(and\s+)?(explain\s+)?(let me know\s+)?(i want to know\s+)?(i wanna know\s+)?(mujhe batao\s+)?(batao\s+)?",
-    re.IGNORECASE,
-)
+_WRAPPER_PATTERNS = [
+    r"^(hey|hi|hello|please|so|ok|okay|well|alright|listen)\b[\s,]*",
+    r"^(can you\s+)?(could you\s+)?(would you\s+)?(will you\s+)?(tell me\s+)?(do you know\s+)?(talk about\s+)?(explain\s+)?(let me know\s+)?(i want to know\s+)?(i wanna know\s+)?(mujhe batao\s+)?(batao\s+)?",
+    r"^(about|what about|and|the|a|an)\b[\s,]*",
+]
 
 
 def extract_query(text: str) -> str:
     """Turn raw user speech into a compact search query."""
     t = (text or "").strip().rstrip("?.! ").strip()
-    prev = None
-    while prev != t:
-        prev = t
-        t = _WRAPPER_RE.sub("", t).strip()
-    t = re.sub(r"^(and|about|the|a|an)\s+", "", t, flags=re.IGNORECASE).strip()
+    changed = True
+    while changed:
+        before = t
+        for pat in _WRAPPER_PATTERNS:
+            t = re.sub(pat, "", t, flags=re.IGNORECASE).strip()
+        changed = (before != t)
+    # Fix common phonetic typos
+    t = re.sub(r"\brelaes\w*\b|\breles\w*\b|\brelaesed\b", "released", t, flags=re.IGNORECASE)
     t = re.sub(r"\s+", " ", t)
     return t[:140]
 
@@ -274,42 +278,64 @@ def _domain(url: str) -> str:
 
 
 async def search_facts(query: str) -> str:
-    """Run all free sources + Crawl4AI web crawler; return a compact LLM context block ("" if none)."""
-    now_str = datetime.now().strftime("%A, %B %d, %Y")
-    is_date_query = bool(re.search(r"\b(today|date|day|time)\b", query, re.I))
+    """Run all free sources (DuckDuckGo + Bing + Wikipedia + Crawl4AI)."""
+    cleaned = extract_query(query)
+    now = datetime.now()
+    now_str = now.strftime("%A, %B %d, %Y")
+    current_year = now.strftime("%Y")
+
+    # Time-sensitive query enrichment for current releases
+    if re.search(r"\b(movie|movies|film|films)\b", cleaned, re.I) and re.search(r"\b(latest|recent|recently|new|released)\b", cleaned, re.I):
+        web_q = f"new movies released {current_year}"
+    elif any(k in cleaned.lower() for k in ("latest", "recent", "new", "released", "upcoming", "current")) and current_year not in cleaned:
+        web_q = f"{cleaned} {current_year}"
+    else:
+        web_q = cleaned
 
     async def _wiki():
         try:
-            return await asyncio.wait_for(wikipedia_lookup(query), timeout=WIKI_TIMEOUT_S)
+            return await asyncio.wait_for(wikipedia_lookup(cleaned), timeout=WIKI_TIMEOUT_S)
         except Exception:
             return None
 
     async def _web():
         try:
-            return await asyncio.wait_for(bing_results(query), timeout=WEB_TIMEOUT_S)
+            return await asyncio.wait_for(bing_results(web_q), timeout=WEB_TIMEOUT_S)
         except Exception:
             return []
 
     async def _ddg():
         try:
-            return await asyncio.wait_for(ddg_instant(query), timeout=3.0)
+            return await asyncio.wait_for(ddg_results(web_q), timeout=WEB_TIMEOUT_S)
         except Exception:
-            return ""
+            return []
 
-    (wiki, web_hits, instant) = await asyncio.gather(_wiki(), _web(), _ddg())
+    (wiki, bing_hits, ddg_hits) = await asyncio.gather(_wiki(), _web(), _ddg())
+
+    is_def_q = any(k in cleaned.lower() for k in ("meaning", "define", "definition", "dictionary", "what does"))
+    seen_urls = set()
+    web_all = []
+    for h in ddg_hits + bing_hits:
+        u = h.get("url", "").lower()
+        title = h.get("title", "").lower()
+        if not is_def_q and any(d in u or d in title for d in ("dictionary", "merriam-webster", "thesaurus", "meaning of")):
+            continue
+        if u and u not in seen_urls:
+            seen_urls.add(u)
+            web_all.append(h)
 
     # Pick top reference URL to crawl with Crawl4AI
     crawl_target = ""
     if wiki and wiki.get("url"):
         crawl_target = wiki["url"]
-    elif web_hits:
-        for r in web_hits:
+    elif web_all:
+        for r in web_all:
             u = r.get("url", "")
-            if "wikipedia.org" in u:
+            if "wikipedia.org" in u or "imdb.com" in u:
                 crawl_target = u
                 break
-        if not crawl_target and web_hits:
-            crawl_target = web_hits[0].get("url", "")
+        if not crawl_target and web_all:
+            crawl_target = web_all[0].get("url", "")
 
     crawled_content = ""
     if crawl_target:
@@ -319,26 +345,29 @@ async def search_facts(query: str) -> str:
             log.info(f"[SEARCH] crawl4ai target {crawl_target!r} error: {e}")
 
     lines: list[str] = []
-    if is_date_query:
+    if any(k in cleaned.lower() for k in ("today", "date", "day", "time")):
         lines.append(f"- Today's actual real-world date is {now_str}.")
 
+    # If wiki match is relevant to the query words, lead with wiki
+    if wiki and wiki.get("extract"):
+        w_title = wiki["title"].lower()
+        if any(w in w_title or w in wiki["extract"].lower() for w in cleaned.lower().split() if len(w) > 3):
+            lines.append(f"- {wiki['extract']} (source: Wikipedia: {wiki['title']})")
+
     if crawled_content:
-        lines.append(f"- {crawled_content[:500]} (source: {_domain(crawl_target)} via Crawl4AI)")
-    elif wiki and wiki.get("extract"):
-        lines.append(f"- {wiki['extract']} (source: Wikipedia: {wiki['title']})")
-    if instant:
-        lines.append(f"- {instant[:350]} (source: DuckDuckGo answer)")
-    for r in web_hits[:4]:
+        lines.append(f"- {crawled_content[:450]} (source: {_domain(crawl_target)} via Crawl4AI)")
+
+    for r in web_all[:5]:
         bit = r.get("snippet") or r.get("title", "")
-        if bit:
-            lines.append(f"- {bit[:250]} (source: {_domain(r.get('url', ''))})")
+        if bit and len(bit) > 20:
+            lines.append(f"- {bit[:250]} (source: {r.get('source', _domain(r.get('url', '')))}: {r.get('title', '')})")
 
     if not lines:
         return ""
     block = "\n".join(lines)[:MAX_FACT_CHARS]
-    log.info(f"[SEARCH] facts for {query!r}: {len(block)} chars, wiki={'yes' if wiki else 'no'}, crawl4ai={'yes' if crawled_content else 'no'}")
+    log.info(f"[SEARCH] facts for {query!r} -> web_q={web_q!r}: {len(block)} chars, wiki={'yes' if wiki else 'no'}, crawl4ai={'yes' if crawled_content else 'no'}")
     return (
-        "[web facts — looked up just now]\n"
+        "[web facts — looked up just now via DuckDuckGo + Bing + Wikipedia]\n"
         + block
-        + "\nUse ONLY these verified facts for names/dates/numbers. Never invent fake sequels, fake directors, or fake versions."
+        + "\nUse ONLY these verified facts. Never invent unannounced sequels, fake directors, or fake versions."
     )
