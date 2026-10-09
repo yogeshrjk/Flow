@@ -231,6 +231,91 @@ async def tts_test(voice: str = "", engine: str = ""):
     return await tts(TTSReq(text="Hey! This is a Fish Audio voice test. How do I sound?", voice=vid, engine="fish"))
 
 
+class TurnReq(BaseModel):
+    text: str
+    mode: str = "free"
+    scenario: str = "casual"
+    correction: str = "balanced"
+    level: str = "auto"
+    language: str = "english"
+    voice_id: str = ""
+    response_mode: str = ""
+    history: list[dict] = []
+    t0: float | None = None
+    turn_id: str = ""
+    req_id: str = ""
+
+
+@app.post("/api/session/{sid}/turn")
+@app.post("/api/turn")
+async def api_turn(req: TurnReq, sid: str = "default"):
+    """Server-Sent Events (SSE) streaming turn endpoint for serverless/HTTP environments."""
+    from fastapi.responses import StreamingResponse
+    from app.conversation.engine import sanitize_error
+    s = engine.get_or_create(sid)
+    if req.mode in ("free", "practice", "correction", "pronunciation", "roleplay", "vocab", "interview", "challenge"):
+        s.mode = req.mode
+    if req.scenario:
+        s.scenario = req.scenario
+    if req.correction in ("passive", "balanced", "active"):
+        s.correction = req.correction
+    if req.level:
+        s.level_setting = req.level
+    if req.language in ("english", "hindi", "hinglish"):
+        s.language = req.language
+    if req.voice_id:
+        s.voice_id = req.voice_id
+    if req.response_mode:
+        s.response_mode = req.response_mode
+    if req.history:
+        s.history = [h for h in req.history if isinstance(h, dict) and "role" in h and "content" in h][-16:]
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def sse_send(msg: dict):
+        await queue.put(f"data: {json.dumps(msg)}\n\n")
+
+    t0 = time.time()
+    turn_id = req.turn_id or str(int(t0 * 1000))
+    req_id = req.req_id or turn_id
+
+    async def event_generator():
+        turn_task = asyncio.create_task(engine.handle_user_turn(
+            s, req.text, sse_send, t0,
+            t_speech_end_ms=req.t0, turn_id=turn_id, req_id=req_id
+        ))
+        try:
+            while not turn_task.done() or not queue.empty():
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    yield chunk
+                except asyncio.TimeoutError:
+                    continue
+            await turn_task
+            while not queue.empty():
+                yield queue.get_nowait()
+            yield "data: [DONE]\n\n"
+        except asyncio.CancelledError:
+            engine.cancel(s.id)
+            yield f"data: {json.dumps({'type': 'llm_cancelled', 'req_id': req_id, 'turn': turn_id})}\n\n"
+            yield "data: [DONE]\n\n"
+            raise
+        except Exception as e:
+            err_msg = sanitize_error(str(e))
+            yield f"data: {json.dumps({'type': 'error', 'scope': 'turn', 'stage': 'HTTP_STREAM', 'message': err_msg, 'req_id': req_id, 'turn': turn_id})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 @app.post("/api/session/{sid}/end")
 async def end_session(sid: str):
     s = engine.sessions.get(sid)

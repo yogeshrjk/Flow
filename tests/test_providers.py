@@ -207,3 +207,23 @@ def test_handle_user_turn_with_req_id():
     assert done_msg.get("req_id") == "req_42_12345"
     assert done_msg.get("turn") == "42"
     assert done_msg.get("text")
+
+
+def test_vercel_sse_turn_endpoint():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    c = TestClient(app)
+    payload = {
+        "text": "Testing Vercel SSE streaming.",
+        "mode": "free",
+        "turn_id": "v1",
+        "req_id": "req_v1"
+    }
+    with c.stream("POST", "/api/session/v_sid/turn", json=payload) as resp:
+        assert resp.status_code == 200
+        events = [line for line in resp.iter_lines() if line.startswith("data:")]
+        assert len(events) >= 2
+        assert any("llm_done" in e for e in events)
+        assert "[DONE]" in events[-1]
+

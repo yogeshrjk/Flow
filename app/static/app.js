@@ -1272,7 +1272,188 @@ async function loadConfig() {
   }
 }
 
+let useHttpTransport = false;
+let wsRapidCloseCount = 0;
+let wsConnectTime = 0;
+let httpTurnAbortController = null;
+
+function handleServerMessage(m) {
+  if (!m) return;
+  if (m.type === 'ready') { if (running) setState('LISTENING'); else setState('IDLE'); }
+  else if (m.type === 'status') {
+    setState(m.state, m.note);
+    if (m.state === 'THINKING' || m.state === 'SPEAKING') {
+      if (!$('aiTyping')) showTypingIndicator();
+    }
+  }
+  else if (m.type === 'llm_token') {
+    fullReply += m.token;
+    // Live only: paint words as they're spoken in sync with audio clock.
+    // Fish modes keep rendering per finished sentence via onSentenceStart (see audio.js).
+    if (audioQ.engine === 'gemini') {
+      try { LiveCaptions.push(m.token); } catch (e) {}
+    }
+  }
+  else if (m.type === 'notice') {
+    // transient center-text note ("Checking..."): display only — never
+    // spoken, never added to transcript/history (those come from llm_done).
+    setAiLine(m.text || 'Checking...');
+  }
+  else if (m.type === 'tts_start_hint') {
+    fullReply = '';
+    if (audioQ.engine === 'gemini') { try { LiveCaptions.start(); } catch (e) {} }
+    setState('SPEAKING');
+    if (!$('aiTyping')) showTypingIndicator();
+  }
+  else if (m.type === 'tts_sentence') {
+    if (m.turn === 'greet' && userTurns > 0) return; // Drop reconnect greeting audio mid-session
+    const stale = !!(m.turn && audioQ.deadTurns.has(m.turn));
+    if (m.lat && !stale) audioQ.turnLat = m.lat;  // server stages for the latency block
+    audioQ.enqueue(m.text, { stream: !!m.first, turn: m.turn, req_id: m.req_id || m.turn });
+  }
+  else if (m.type === 'live_audio_chunk') {
+    audioQ.playLivePcmChunk(m.data, 24000, m.turn);
+  }
+  else if (m.type === 'response_mode') { labelFor(m.value); log('[AI] mode confirmed:', respModeLabel); }
+  else if (m.type === 'llm_done') {
+    const reqId = m.req_id || m.turn || String(turnSeq);
+    log(`[LLM req_id=${reqId}] LLM response received in client (chars=${(m.text || '').length})`);
+    hideTypingIndicator();
+    fullReply = '';
+    const displayText = m.display_text || m.text;
+    // Live center line mirrors the voice: latest chunk only (fish path keeps
+    // its own per-sentence display and is untouched by liveChunkText).
+    const centerText = m.live ? (liveChunkText(displayText) || displayText) : displayText;
+    if (!m.greeting || userTurns === 0) {
+      addTurn('Partner', displayText);
+    }
+    log(`[UI req_id=${reqId}] assistant message rendered in chat`);
+    if (m.live) {
+      // Live ticker owns the center line until the voice drains: never dump
+      // the paragraph here. Hand it the final text and let it converge.
+      // No dissolve here either — audioQ.onDrained fades the line when the
+      // voice actually finishes (a timer now would fight the ticker).
+      if (!m.partial && state !== 'INTERRUPTED') {
+        try { LiveCaptions.finish(displayText); } catch (e) { setAiLine(centerText); }
+      } else {
+        try { LiveCaptions.stop(); } catch (e) {}
+      }
+    }
+    if (m.correction && m.correction.length) log('[COACH]', JSON.stringify(m.correction));
+    if (!audioQ.busy) {
+      if (!m.partial && state !== 'INTERRUPTED') {
+        setAiLine(centerText);
+        smokeDissolveAiLine(1400);
+      }
+      if (running && state !== 'INTERRUPTED') setState('LISTENING');
+    }
+  } else if (m.type === 'llm_cancelled') {
+    const reqId = m.req_id || m.turn || String(turnSeq);
+    log(`[TURN req_id=${reqId}] turn cancelled`);
+    hideTypingIndicator();
+    fullReply = '';
+    try { LiveCaptions.stop(); } catch (e) {}
+    setAiLine('');
+  }
+  else if (m.type === 'mode') {
+    if ($('mode') && (m.mode === 'free' || m.mode === 'practice')) {
+      $('mode').value = m.mode;
+      updateModeUI();
+    }
+    log('[MODE]', m.mode);
+  }
+  else if (m.type === 'voice_error') {
+    const status = $('fishStatus');
+    if (status) status.textContent = m.error || 'The selected voice could not be used.';
+    log('[TTS] voice selection rejected:', m.error || m.value);
+  }
+  else if (m.type === 'error') {
+    const reqId = m.req_id || m.turn || String(turnSeq);
+    hideTypingIndicator();
+    log(`[ERROR req_id=${reqId}] stage=${m.stage || m.scope || 'unknown'} error=${sanitizeError(m.message)}`);
+    if (running) setState('LISTENING');
+  }
+}
+
+async function streamHttpTurn(text, turnId, reqId) {
+  if (httpTurnAbortController) {
+    try { httpTurnAbortController.abort(); } catch (e) {}
+  }
+  httpTurnAbortController = new AbortController();
+  const signal = httpTurnAbortController.signal;
+
+  const payload = {
+    text,
+    mode: $('mode') ? $('mode').value : 'free',
+    scenario: $('scenario') ? $('scenario').value : 'casual',
+    correction: $('correction') ? $('correction').value : 'balanced',
+    level: $('level') ? $('level').value : 'auto',
+    language: $('language') ? $('language').value : 'english',
+    voice_id: audioQ.fishVoice || '',
+    response_mode: respMode,
+    history: getStoredChatHistory().slice(-10).map(x => ({ role: x.who === 'You' ? 'user' : 'assistant', content: x.text })),
+    t0: Date.now(),
+    turn_id: turnId,
+    req_id: reqId
+  };
+
+  try {
+    const response = await fetch('/api/session/' + encodeURIComponent(sid) + '/turn', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal
+    });
+
+    if (!response.ok) {
+      let errMsg = 'HTTP ' + response.status;
+      try { const errObj = await response.json(); errMsg = errObj.error || errObj.message || errMsg; } catch (e) {}
+      handleServerMessage({ type: 'error', scope: 'http', stage: 'HTTP_TURN', message: errMsg, req_id: reqId, turn: turnId });
+      handleServerMessage({ type: 'llm_done', text: "Sorry, I had a little hiccup. Can you say that again?", req_id: reqId, turn: turnId });
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() || '';
+      for (const block of lines) {
+        const trimmed = block.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const rawJson = trimmed.slice(5).trim();
+        if (rawJson === '[DONE]') continue;
+        try {
+          const msg = JSON.parse(rawJson);
+          handleServerMessage(msg);
+        } catch (err) {
+          console.warn('[SSE] parse error:', err, rawJson);
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      log(`[TURN req_id=${reqId}] turn aborted by client`);
+      handleServerMessage({ type: 'llm_cancelled', req_id: reqId, turn: turnId });
+    } else {
+      log(`[ERROR req_id=${reqId}] HTTP stream failed: ${sanitizeError(e.message || e)}`);
+      handleServerMessage({ type: 'error', scope: 'http', stage: 'HTTP_STREAM', message: e.message || 'Stream error', req_id: reqId, turn: turnId });
+      handleServerMessage({ type: 'llm_done', text: "Sorry, I had a little hiccup. Can you say that again?", req_id: reqId, turn: turnId });
+    }
+  } finally {
+    if (httpTurnAbortController && httpTurnAbortController.signal === signal) {
+      httpTurnAbortController = null;
+    }
+  }
+}
+
 async function connect() {
+  if (useHttpTransport) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
@@ -1299,8 +1480,17 @@ async function connect() {
     const sel = $('language') && $('language').value;
     langParam = (sel || localStorage.getItem('lang') || 'english');
   } catch (e) {}
-  ws = new WebSocket(`${proto}://${location.host}/ws/session/${sid}?lang=${encodeURIComponent(langParam)}`);
+
+  try {
+    ws = new WebSocket(`${proto}://${location.host}/ws/session/${sid}?lang=${encodeURIComponent(langParam)}`);
+  } catch (err) {
+    useHttpTransport = true;
+    log('[TRANSPORT] WebSocket unavailable — switched to HTTP/SSE streaming transport');
+    return;
+  }
+
   ws.onopen = () => {
+    wsConnectTime = Date.now();
     log('[WS] connected', sid);
     try {
       const saved = localStorage.getItem('lang');
@@ -1336,108 +1526,31 @@ async function connect() {
     // chosen response mode rides the socket so the very next reply uses it
     try { ws.send(JSON.stringify({ type: 'set_response_mode', value: respMode })); } catch (e) {}
   };
+
   ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.type === 'ready') { if (running) setState('LISTENING'); else setState('IDLE'); }
-    else if (m.type === 'status') {
-      setState(m.state, m.note);
-      if (m.state === 'THINKING' || m.state === 'SPEAKING') {
-        if (!$('aiTyping')) showTypingIndicator();
-      }
-    }
-    else if (m.type === 'llm_token') {
-      fullReply += m.token;
-      // Live only: paint words as they're spoken in sync with audio clock.
-      // Fish modes keep rendering per finished sentence via onSentenceStart (see audio.js).
-      if (audioQ.engine === 'gemini') {
-        try { LiveCaptions.push(m.token); } catch (e) {}
-      }
-    }
-    else if (m.type === 'notice') {
-      // transient center-text note ("Checking..."): display only — never
-      // spoken, never added to transcript/history (those come from llm_done).
-      setAiLine(m.text || 'Checking...');
-    }
-    else if (m.type === 'tts_start_hint') {
-      fullReply = '';
-      if (audioQ.engine === 'gemini') { try { LiveCaptions.start(); } catch (e) {} }
-      setState('SPEAKING');
-      if (!$('aiTyping')) showTypingIndicator();
-    }
-    else if (m.type === 'tts_sentence') {
-      if (m.turn === 'greet' && userTurns > 0) return; // Drop reconnect greeting audio mid-session
-      const stale = !!(m.turn && audioQ.deadTurns.has(m.turn));
-      if (m.lat && !stale) audioQ.turnLat = m.lat;  // server stages for the latency block
-      audioQ.enqueue(m.text, { stream: !!m.first, turn: m.turn, req_id: m.req_id || m.turn });
-    }
-    else if (m.type === 'live_audio_chunk') {
-      audioQ.playLivePcmChunk(m.data, 24000, m.turn);
-    }
-    else if (m.type === 'response_mode') { labelFor(m.value); log('[AI] mode confirmed:', respModeLabel); }
-    else if (m.type === 'llm_done') {
-      const reqId = m.req_id || m.turn || String(turnSeq);
-      log(`[LLM req_id=${reqId}] LLM response received in client (chars=${(m.text || '').length})`);
-      hideTypingIndicator();
-      fullReply = '';
-      const displayText = m.display_text || m.text;
-      // Live center line mirrors the voice: latest chunk only (fish path keeps
-      // its own per-sentence display and is untouched by liveChunkText).
-      const centerText = m.live ? (liveChunkText(displayText) || displayText) : displayText;
-      if (!m.greeting || userTurns === 0) {
-        addTurn('Partner', displayText);
-      }
-      log(`[UI req_id=${reqId}] assistant message rendered in chat`);
-      if (m.live) {
-        // Live ticker owns the center line until the voice drains: never dump
-        // the paragraph here. Hand it the final text and let it converge.
-        // No dissolve here either — audioQ.onDrained fades the line when the
-        // voice actually finishes (a timer now would fight the ticker).
-        if (!m.partial && state !== 'INTERRUPTED') {
-          try { LiveCaptions.finish(displayText); } catch (e) { setAiLine(centerText); }
-        } else {
-          try { LiveCaptions.stop(); } catch (e) {}
-        }
-      }
-      if (m.correction && m.correction.length) log('[COACH]', JSON.stringify(m.correction));
-      if (!audioQ.busy) {
-        if (!m.partial && state !== 'INTERRUPTED') {
-          setAiLine(centerText);
-          smokeDissolveAiLine(1400);
-        }
-        if (running && state !== 'INTERRUPTED') setState('LISTENING');
-      }
-    } else if (m.type === 'llm_cancelled') {
-      const reqId = m.req_id || m.turn || String(turnSeq);
-      log(`[TURN req_id=${reqId}] turn cancelled`);
-      hideTypingIndicator();
-      fullReply = '';
-      try { LiveCaptions.stop(); } catch (e) {}
-      setAiLine('');
-    }
-    else if (m.type === 'mode') {
-      if ($('mode') && (m.mode === 'free' || m.mode === 'practice')) {
-        $('mode').value = m.mode;
-        updateModeUI();
-      }
-      log('[MODE]', m.mode);
-    }
-    else if (m.type === 'voice_error') {
-      const status = $('fishStatus');
-      if (status) status.textContent = m.error || 'The selected voice could not be used.';
-      log('[TTS] voice selection rejected:', m.error || m.value);
-    }
-    else if (m.type === 'error') {
-      const reqId = m.req_id || m.turn || String(turnSeq);
-      hideTypingIndicator();
-      log(`[ERROR req_id=${reqId}] stage=${m.stage || m.scope || 'unknown'} error=${sanitizeError(m.message)}`);
-      if (running) setState('LISTENING');
-    }
+    try {
+      const m = JSON.parse(ev.data);
+      handleServerMessage(m);
+    } catch (e) {}
   };
+
   ws.onclose = () => {
-    log('[WS] closed — reconnect in 2s');
     ws = null;
-    if (running) setTimeout(connect, 2000);
+    const sessionDuration = Date.now() - wsConnectTime;
+    if (sessionDuration < 3500) {
+      wsRapidCloseCount++;
+      if (wsRapidCloseCount >= 2) {
+        useHttpTransport = true;
+        log('[TRANSPORT] WebSocket closed in serverless environment — switched to HTTP/SSE streaming transport');
+        return;
+      }
+    }
+    if (running && !useHttpTransport) {
+      log('[WS] closed — reconnect in 2s');
+      setTimeout(connect, 2000);
+    }
   };
+
   if (!window.__wsPingTimer) {
     window.__wsPingTimer = setInterval(() => {
       try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' })); } catch (e) {}
@@ -1487,33 +1600,16 @@ async function sendText(text) {
   text = (text || '').trim();
   if (!text) return;
 
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    log('[TURN] WebSocket not ready — connecting now...');
-    try {
-      await connect();
-    } catch (e) {
-      log('[ERROR] stage=WEBSOCKET error=Connection failed');
-      hearNote('Connecting to server... Please try again.');
-      return;
-    }
-    let waitCount = 0;
-    while (ws && ws.readyState === WebSocket.CONNECTING && waitCount < 30) {
-      await new Promise(r => setTimeout(r, 100));
-      waitCount++;
-    }
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      log('[ERROR] stage=WEBSOCKET error=WebSocket not open');
-      hearNote('Could not connect to server. Please try again.');
-      return;
-    }
-  }
-
   // Guard against duplicate send of the exact same utterance within 1.2s
   if (lastSentText && (performance.now() - lastSentAt < 1200) && sameText(text, lastSentText, 0.85)) {
     log('[TURN] duplicate turn suppressed:', JSON.stringify(text));
     return;
   }
   audioQ.cancel(); // Cancel any superseded in-flight audio from prior turn
+  if (httpTurnAbortController) {
+    try { httpTurnAbortController.abort(); } catch (e) {}
+    httpTurnAbortController = null;
+  }
   lastSentText = text; lastSentAt = performance.now();
   addTurn('You', text);
   showTypingIndicator();
@@ -1533,8 +1629,14 @@ async function sendText(text) {
   audioQ._turnT0 = performance.now();
   audioQ._expectFirst = true;
   audioQ.turnLat = null;
-  log(`[CHAT req_id=${reqId}] text submission started: "${text.slice(0, 80)}"`);
-  ws.send(JSON.stringify({ type: 'user_transcript', text, t0: Date.now(), turn_id: turnId, req_id: reqId }));
+  const transportLabel = useHttpTransport || !ws || ws.readyState !== WebSocket.OPEN ? 'HTTP/SSE' : 'WebSocket';
+  log(`[CHAT req_id=${reqId}] text submission started: "${text.slice(0, 80)}" (${transportLabel})`);
+
+  if (useHttpTransport || !ws || ws.readyState !== WebSocket.OPEN) {
+    streamHttpTurn(text, turnId, reqId);
+  } else {
+    ws.send(JSON.stringify({ type: 'user_transcript', text, t0: Date.now(), turn_id: turnId, req_id: reqId }));
+  }
 }
 const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || ('ontouchstart' in window && window.innerWidth < 800);
 
@@ -1554,6 +1656,7 @@ function commitTurnIfReady() {
 
 let recogRestartTimer = null;
 let recogFatal = false;
+let consecutiveAborts = 0;
 
 function setupRecog() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -1565,6 +1668,7 @@ function setupRecog() {
   r.continuous = !isMobile;
   r.maxAlternatives = 1;
   recogFatal = false;
+  consecutiveAborts = 0;
   clearTimeout(recogRestartTimer);
 
   r.onspeechstart = () => {
@@ -1594,6 +1698,7 @@ function setupRecog() {
 
   r.onresult = (ev) => {
     if (micMuted || !listening) return; // deaf while mic-muted: no turns, no interrupts
+    consecutiveAborts = 0;
     let interim = '', fin = '', conf = 1;
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const res = ev.results[i];
@@ -1634,7 +1739,12 @@ function setupRecog() {
     }
   };
   r.onerror = (e) => {
-    log('[STT] error', e.error);
+    if (e.error === 'aborted') {
+      consecutiveAborts++;
+      if (consecutiveAborts <= 2) log('[STT] aborted');
+    } else {
+      log('[STT] error', e.error);
+    }
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
       recogFatal = true;
       listening = false;
@@ -1642,7 +1752,7 @@ function setupRecog() {
     } else if (e.error === 'no-speech') {
       // transient silence on mobile — normal, onend restarts smoothly
     } else if (e.error === 'aborted') {
-      // aborted by manual action or turn change
+      // aborted by hardware contention or turn change
     } else if (e.error === 'network') {
       // transient network interruption with cloud speech service
     } else if (e.error === 'audio-capture') {
@@ -1651,11 +1761,15 @@ function setupRecog() {
       hearNote('No microphone found — plug one in, then press mic again.');
     }
   };
-  r.onaudiostart = () => log('[STT] mic stream opened');
+  r.onaudiostart = () => {
+    consecutiveAborts = 0;
+    log('[STT] mic stream opened');
+  };
   r.onaudioend = () => log('[STT] mic stream closed');
   r.onend = () => {
     if (listening && running && !recogFatal) {
       clearTimeout(recogRestartTimer);
+      const delay = consecutiveAborts > 2 ? 1500 : (isMobile ? 180 : 350);
       recogRestartTimer = setTimeout(() => {
         if (listening && running && !recogFatal) {
           try {
@@ -1665,10 +1779,10 @@ function setupRecog() {
               if (listening && running && !recogFatal) {
                 try { r.start(); } catch (err) {}
               }
-            }, isMobile ? 250 : 500);
+            }, isMobile ? 350 : 600);
           }
         }
-      }, isMobile ? 120 : 350);
+      }, delay);
     }
   };
   return r;
@@ -1757,11 +1871,15 @@ function micTestErrorMessage(error) {
 
 function bargeIn() {
   audioQ.cancel();
+  if (httpTurnAbortController) {
+    try { httpTurnAbortController.abort(); } catch (e) {}
+    httpTurnAbortController = null;
+  }
   hideTypingIndicator();
   try { LiveCaptions.stop(); } catch (e) {}
   setState('INTERRUPTED');
   setAiLine('');
-  try { ws.send(JSON.stringify({ type: 'barge_in' })); } catch (e) {}
+  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'barge_in' })); } catch (e) {}
   fullReply = '';
   setTimeout(() => { if (state === 'INTERRUPTED') setState('LISTENING'); }, 600);
 }

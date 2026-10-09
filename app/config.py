@@ -10,6 +10,13 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _default_data_dir() -> str:
+    if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return "/tmp/data"
+    env_dir = os.environ.get("DATA_DIR", "./data").strip()
+    return env_dir or "./data"
+
+
 @dataclass
 class Settings:
     # --- Fast tier: Groq (OpenAI-compatible chat completions, very low TTFT) ---
@@ -52,7 +59,7 @@ class Settings:
 
     host: str = field(default_factory=lambda: _env("HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(_env("PORT", "8000") or "8000"))
-    data_dir: str = field(default_factory=lambda: _env("DATA_DIR", "./data"))
+    data_dir: str = field(default_factory=_default_data_dir)
     default_mode: str = field(default_factory=lambda: _env("DEFAULT_MODE", "free"))
     default_correction: str = field(default_factory=lambda: _env("DEFAULT_CORRECTION", "balanced"))
     default_level: str = field(default_factory=lambda: _env("DEFAULT_LEVEL", "auto"))
