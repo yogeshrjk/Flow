@@ -1999,19 +1999,22 @@ function closeDrawers() {
   $('panel').classList.add('hidden');
   $('history').classList.add('hidden');
   $('scrim').classList.add('hidden');
+  document.body.classList.remove('drawer-open');
   $('settingsBtn').classList.remove('hidden');
+  $('historyBtn').classList.remove('hidden');
 }
 function openPanel(o) {
   if (o) $('history').classList.add('hidden');
   $('panel').classList.toggle('hidden', !o);
   $('scrim').classList.toggle('hidden', !o);
-  $('settingsBtn').classList.toggle('hidden', o);
+  document.body.classList.toggle('drawer-open', o);
   icons();
 }
 function openHistory(o) {
   if (o) $('panel').classList.add('hidden');
   $('history').classList.toggle('hidden', !o);
   $('scrim').classList.toggle('hidden', !o);
+  document.body.classList.toggle('drawer-open', o);
   if (o) {
     initChatSmoke();
     refreshEmptyHint();
@@ -2062,6 +2065,7 @@ document.addEventListener('keydown', (event) => {
   }
 });
 $('panelClose').onclick = () => openPanel(false);
+if ($('historyClose')) $('historyClose').onclick = () => openHistory(false);
 $('historyBtn').onclick = () => {
   // icon toggles the history drawer both ways
   openHistory($('history').classList.contains('hidden'));

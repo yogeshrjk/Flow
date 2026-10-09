@@ -224,9 +224,19 @@ body.voice-picker-open{overflow:hidden}
   .iconbtn.primary svg{width:24px;height:24px}
   .inputpill{margin-bottom:16px;padding:5px 6px 5px 14px}
   .inputpill input{font-size:13px}
-  .settings{right:12px;top:calc(12px + env(safe-area-inset-top, 0px));bottom:auto;width:40px;height:40px}
-  .histbtn{left:12px;top:calc(12px + env(safe-area-inset-top, 0px));bottom:auto;width:40px;height:40px}
+  .settings{right:12px;top:calc(12px + env(safe-area-inset-top, 0px));left:auto;bottom:auto;width:40px;height:40px}
+  .histbtn{right:58px;top:calc(12px + env(safe-area-inset-top, 0px));left:auto;bottom:auto;width:40px;height:40px}
   .settings svg,.histbtn svg{width:18px;height:18px}
+  body.drawer-open .settings,
+  body.drawer-open .histbtn,
+  body:has(#panel:not(.hidden)) .settings,
+  body:has(#panel:not(.hidden)) .histbtn,
+  body:has(#history:not(.hidden)) .settings,
+  body:has(#history:not(.hidden)) .histbtn {
+    display: none !important;
+  }
+  .topbar{position:relative;width:100%;padding-right:96px}
+  .clock{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:12px;color:#5b6474;font-variant-numeric:tabular-nums}
   .sidebar{width:100vw;max-width:100vw;padding:14px 14px calc(75px + env(safe-area-inset-bottom, 0px));background:rgba(5,7,12,.96);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:none;box-shadow:none}
   .scrim{background:rgba(0,0,0,.55);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
   .panel{width:100vw;max-width:100vw;padding:0 0 calc(75px + env(safe-area-inset-bottom, 0px))}

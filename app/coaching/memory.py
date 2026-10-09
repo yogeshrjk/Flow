@@ -7,17 +7,20 @@ from pathlib import Path
 
 def _root(data_dir: str) -> Path:
     p = Path(data_dir) / "profiles"
-    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     return p
 
 
 def load_profile(data_dir: str, user_id: str = "default") -> dict:
-    fp = _root(data_dir) / f"{user_id}.json"
-    if fp.exists():
-        try:
+    try:
+        fp = _root(data_dir) / f"{user_id}.json"
+        if fp.exists():
             return json.loads(fp.read_text())
-        except Exception:
-            pass
+    except Exception:
+        pass
     return {
         "user_id": user_id,
         "level": "B1",
@@ -35,8 +38,11 @@ def load_profile(data_dir: str, user_id: str = "default") -> dict:
 
 
 def save_profile(data_dir: str, profile: dict) -> None:
-    fp = _root(data_dir) / f"{profile.get('user_id', 'default')}.json"
-    fp.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
+    try:
+        fp = _root(data_dir) / f"{profile.get('user_id', 'default')}.json"
+        fp.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
 
 
 def update_after_turn(profile: dict, mistakes: list, words: int, seconds: float, conf: float, topic_hint: str = "") -> dict:

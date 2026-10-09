@@ -7,7 +7,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
-<link rel="stylesheet" href="/static/styles.css?v=75" />
+<link rel="stylesheet" href="/static/styles.css?v=77" />
 </head>
 <body>
 <canvas id="orb" class="wavefull" width="1280" height="240"></canvas>
@@ -21,7 +21,7 @@
   <aside id="history" class="sidebar hidden">
     <div class="sidebarhead">
       <span class="ptitle">Conversation</span>
-      <button id="clearChatBtn" class="iconbtn sm ghost" title="Clear chat history" aria-label="Clear chat history"><i data-lucide="trash-2"></i></button>
+      <button id="historyClose" class="iconbtn sm ghost" aria-label="Close conversation history"><i data-lucide="x"></i></button>
     </div>
     <div id="emptyHint" class="emptyhint">Your conversation will appear here…</div>
     <div id="transcript" class="transcript side"></div>
@@ -201,6 +201,6 @@
 <script src="/static/vad.js?v=26"></script>
 <script src="/static/audio.js?v=36"></script>
 <script src="/static/orb.js?v=49"></script>
-<script src="/static/app.js?v=89"></script>
+<script src="/static/app.js?v=90"></script>
 </body>
 </html>

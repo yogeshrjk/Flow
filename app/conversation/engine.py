@@ -769,7 +769,74 @@ class Engine:
             raise
         except Exception as e:
             err_msg = sanitize_error(str(e))
-            log.error(f"[ERROR req_id={req_id}] stage=LLM error={err_msg}")
+            log.error(f"[ERROR req_id={req_id}] stage=LLM error={err_msg} — attempting provider fallback")
+            fallback_llm = None
+            if want_mode in ("groq_fish", "fast") and self.providers.get("gemini_fish"):
+                fallback_llm = self.providers.get("gemini_fish")
+            elif self.mock:
+                fallback_llm = self.mock
+
+            if fallback_llm and fallback_llm is not llm:
+                try:
+                    log.info(f"[LLM req_id={req_id}] fallback LLM stream started provider={getattr(fallback_llm, 'name', '?')}")
+                    async for tok in fallback_llm.stream(messages, max_tokens=180):
+                        if s.cancelled:
+                            await send({"type": "llm_cancelled", "req_id": req_id, "turn": turn_id})
+                            return
+                        if not first_token_logged:
+                            t_first_token = time.time() - t_llm0
+                            lat["llm_ttft_ms"] = t_first_token * 1000
+                            first_token_logged = True
+                            await send({"type": "tts_start_hint", "req_id": req_id, "turn": turn_id})
+                        full.append(tok)
+                        buf += tok
+                        await send({"type": "llm_token", "token": tok, "req_id": req_id, "turn": turn_id})
+                        if not first_chunk_done and not coalescer.held:
+                            split = first_chunk_split(buf)
+                            if split:
+                                head, buf = split
+                                spoken = clean_for_speech(head)
+                                if spoken:
+                                    _mark_chunk()
+                                    await speak_chunk(spoken, True)
+                                    first_chunk_done = True
+                        sentences, buf = chunk_sentences(buf)
+                        for sent in sentences:
+                            if s.cancelled:
+                                return
+                            if not first_chunk_done and len(sent.strip()) >= FIRST_SENT_MIN:
+                                spoken = clean_for_speech(sent)
+                                if spoken:
+                                    _mark_chunk()
+                                    await speak_chunk(spoken, True)
+                                    first_chunk_done = True
+                                continue
+                            for chunk in coalescer.feed(sent):
+                                spoken = clean_for_speech(chunk)
+                                if spoken:
+                                    await speak_chunk(spoken, not first_chunk_done)
+                                    first_chunk_done = True
+                    for chunk in coalescer.flush(buf):
+                        spoken = clean_for_speech(chunk)
+                        if spoken:
+                            await speak_chunk(spoken, not first_chunk_done)
+                            first_chunk_done = True
+                    reply = "".join(full).strip()
+                    if reply:
+                        s.history.append({"role": "assistant", "content": reply})
+                        s.turns.append({"role": "assistant", "text": reply, "t": time.time()})
+                        log.info(f"[LLM req_id={req_id}] fallback LLM response received chars={len(reply)}")
+                        await send({"type": "llm_done", "text": reply,
+                                    "display_text": strip_emotion_tags(reply),
+                                    "correction": [ {"kind": m.kind, "hint": m.correction_hint} for m in to_correct ],
+                                    "level": s.level, "confidence": conf,
+                                    "req_id": req_id,
+                                    "turn": turn_id})
+                        await send({"type": "status", "state": "LISTENING", "req_id": req_id, "turn": turn_id})
+                        return
+                except Exception as fe:
+                    log.error(f"[ERROR req_id={req_id}] fallback provider also failed: {sanitize_error(str(fe))}")
+
             await send({"type": "error", "scope": "llm", "stage": "LLM", "message": err_msg, "req_id": req_id, "turn": turn_id})
             # graceful spoken fallback (still conversational)
             fb = "Sorry, I had a little hiccup. Can you say that again?"

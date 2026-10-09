@@ -56,10 +56,18 @@ class GroqProvider(LLMProvider):
     name = "groq"  # internal only — never rendered in the UI
 
     def __init__(self, models: list[str] | None = None, base_url: str | None = None, api_key: str | None = None):
-        self.models = [m for m in (models or settings.groq_models) if m]
+        base_models = [m for m in (models or settings.groq_models) if m]
+        # Append resilient fallbacks if not already present
+        fallbacks = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b", "allam-2-7b"]
+        seen = set(base_models)
+        for fb in fallbacks:
+            if fb not in seen:
+                base_models.append(fb)
+                seen.add(fb)
+        self.models = base_models
         self.base_url = (base_url or settings.groq_base_url).rstrip("/") + "/"
         self.api_key = api_key if api_key is not None else settings.groq_api_key
-        self.active_model = self.models[0] if self.models else "llama-3.1-8b-instant"
+        self.active_model = self.models[0] if self.models else "qwen/qwen3.8-27b"
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -25,6 +26,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s
 log = logging.getLogger("app")
 
 app = FastAPI(title="Flow")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
 
@@ -258,83 +268,89 @@ async def ws_session(ws: WebSocket, sid: str, lang: str = ""):
             except Exception:
                 continue
             mtype = msg.get("type")
-            if mtype == "user_transcript":
-                t0 = time.time()
-                # cancel any in-flight reply (barge-in safety)
-                engine.cancel(s.id)
-                # t0/turn_id come from the client so "speech_end → first audio" is real
-                turn_id = str(msg.get("turn_id", ""))
-                req_id = str(msg.get("req_id") or turn_id or s.id)
-                task = asyncio.create_task(engine.handle_user_turn(
-                    s, msg.get("text", ""), send, t0,
-                    t_speech_end_ms=msg.get("t0"), turn_id=turn_id, req_id=req_id))
-                engine.tasks[s.id] = task
-                # never await here: the receive loop must keep reading, otherwise a
-                # barge_in (or the next turn) can't cancel this turn mid-reply
-                task.add_done_callback(lambda t: t.cancelled() or
-                                       (t.exception() and log.warning(f"[TURN req_id={req_id}] task error: {t.exception()}")))
-            elif mtype == "partial":
-                # useful for interruption prediction / latency logging only
-                log.info(f"[STT] partial sid={s.id} {str(msg.get('text',''))[:80]!r}")
-            elif mtype == "barge_in":
-                log.info(f"[AUDIO] barge-in sid={s.id} — cancelling TTS+LLM")
-                engine.cancel(s.id)
-                await send({"type": "status", "state": "INTERRUPTED"})
-                await send({"type": "status", "state": "LISTENING"})
-            elif mtype == "set_mode":
-                mode = str(msg.get("mode", "free"))
-                if mode in ("free", "practice", "correction", "pronunciation", "roleplay", "vocab", "interview", "challenge"):
-                    s.mode = mode
-                    if msg.get("scenario"):
-                        s.scenario = msg["scenario"]
-                    if mode == "challenge":
-                        s.challenge = today_challenge()
-                    await send({"type": "mode", "mode": s.mode, "scenario": s.scenario})
-            elif mtype == "set_correction":
-                if msg.get("value") in ("passive", "balanced", "active"):
-                    s.correction = msg["value"]
-                    await send({"type": "correction", "value": s.correction})
-            elif mtype == "set_level":
-                s.level_setting = str(msg.get("value", "auto"))
-                await send({"type": "level", "value": s.level_setting})
-            elif mtype == "set_language":
-                lang = str(msg.get("value", "english")).lower()
-                if lang in ("english", "hindi", "hinglish"):
-                    s.language = lang
-                    await send({"type": "language", "value": s.language})
-            elif mtype == "set_response_mode":
-                mode = str(msg.get("value", "")).lower()
-                if mode in ("groq_fish", "gemini_fish", "gemini_live", "fast", "quality", "live"):
-                    s.response_mode = mode
-                    await send({"type": "response_mode", "value": mode})
-            elif mtype == "set_voice":
-                vid = str(msg.get("value", ""))
-                from app.voices import FISH_VOICES, GEMINI_VOICES, persona_for
-                valid_ids = {v["id"] for v in FISH_VOICES} | {v["id"] for v in GEMINI_VOICES}
-                try:
-                    valid = vid in valid_ids or await fish_voice_library.is_public_model(vid)
-                except FishLibraryError as exc:
-                    await send({"type": "voice_error", "error": exc.message, "value": vid})
-                    continue
-                if valid:
-                    s.voice_id = vid
-                    pname, pgender = persona_for(vid)
-                    await send({"type": "voice", "value": vid, "persona": pname})
-                else:
-                    await send({"type": "voice_error", "error": "Voice is not public or is unavailable.", "value": vid})
-            elif mtype == "sync_history":
-                turns = msg.get("turns") or []
-                if isinstance(turns, list) and turns:
-                    engine.sync_past_history(s, turns)
-            elif mtype == "clear_history":
-                s.history.clear()
-                s.turns.clear()
-                s.past_chat_summary = ""
-            elif mtype == "end":
-                summary = engine.end_session(s)
-                await send({"type": "summary", **summary})
-            elif mtype == "ping":
-                await send({"type": "pong"})
+            try:
+                if mtype == "user_transcript":
+                    t0 = time.time()
+                    # cancel any in-flight reply (barge-in safety)
+                    engine.cancel(s.id)
+                    # t0/turn_id come from the client so "speech_end → first audio" is real
+                    turn_id = str(msg.get("turn_id", ""))
+                    req_id = str(msg.get("req_id") or turn_id or s.id)
+                    task = asyncio.create_task(engine.handle_user_turn(
+                        s, msg.get("text", ""), send, t0,
+                        t_speech_end_ms=msg.get("t0"), turn_id=turn_id, req_id=req_id))
+                    engine.tasks[s.id] = task
+                    # never await here: the receive loop must keep reading, otherwise a
+                    # barge_in (or the next turn) can't cancel this turn mid-reply
+                    task.add_done_callback(lambda t: t.cancelled() or
+                                           (t.exception() and log.warning(f"[TURN req_id={req_id}] task error: {t.exception()}")))
+                elif mtype == "partial":
+                    # useful for interruption prediction / latency logging only
+                    log.info(f"[STT] partial sid={s.id} {str(msg.get('text',''))[:80]!r}")
+                elif mtype == "barge_in":
+                    log.info(f"[AUDIO] barge-in sid={s.id} — cancelling TTS+LLM")
+                    engine.cancel(s.id)
+                    await send({"type": "status", "state": "INTERRUPTED"})
+                    await send({"type": "status", "state": "LISTENING"})
+                elif mtype == "set_mode":
+                    mode = str(msg.get("mode", "free"))
+                    if mode in ("free", "practice", "correction", "pronunciation", "roleplay", "vocab", "interview", "challenge"):
+                        s.mode = mode
+                        if msg.get("scenario"):
+                            s.scenario = msg["scenario"]
+                        if mode == "challenge":
+                            s.challenge = today_challenge()
+                        await send({"type": "mode", "mode": s.mode, "scenario": s.scenario})
+                elif mtype == "set_correction":
+                    if msg.get("value") in ("passive", "balanced", "active"):
+                        s.correction = msg["value"]
+                        await send({"type": "correction", "value": s.correction})
+                elif mtype == "set_level":
+                    s.level_setting = str(msg.get("value", "auto"))
+                    await send({"type": "level", "value": s.level_setting})
+                elif mtype == "set_language":
+                    lang = str(msg.get("value", "english")).lower()
+                    if lang in ("english", "hindi", "hinglish"):
+                        s.language = lang
+                        await send({"type": "language", "value": s.language})
+                elif mtype == "set_response_mode":
+                    mode = str(msg.get("value", "")).lower()
+                    if mode in ("groq_fish", "gemini_fish", "gemini_live", "fast", "quality", "live"):
+                        s.response_mode = mode
+                        await send({"type": "response_mode", "value": mode})
+                elif mtype == "set_voice":
+                    vid = str(msg.get("value", ""))
+                    from app.voices import FISH_VOICES, GEMINI_VOICES, persona_for
+                    valid_ids = {v["id"] for v in FISH_VOICES} | {v["id"] for v in GEMINI_VOICES}
+                    valid = False
+                    try:
+                        valid = bool(vid) and (vid in valid_ids or await fish_voice_library.is_public_model(vid))
+                    except Exception as exc:
+                        log.warning(f"[WS] voice validation error: {exc}")
+                        valid = False
+                    if valid:
+                        s.voice_id = vid
+                        pname, pgender = persona_for(vid)
+                        await send({"type": "voice", "value": vid, "persona": pname})
+                    else:
+                        s.voice_id = DEFAULT_FISH_VOICE
+                        pname, pgender = persona_for(s.voice_id)
+                        await send({"type": "voice", "value": s.voice_id, "persona": pname})
+                elif mtype == "sync_history":
+                    turns = msg.get("turns") or []
+                    if isinstance(turns, list) and turns:
+                        engine.sync_past_history(s, turns)
+                elif mtype == "clear_history":
+                    s.history.clear()
+                    s.turns.clear()
+                    s.past_chat_summary = ""
+                elif mtype == "end":
+                    summary = engine.end_session(s)
+                    await send({"type": "summary", **summary})
+                elif mtype == "ping":
+                    await send({"type": "pong"})
+            except Exception as me:
+                log.error(f"[WS] message handling error mtype={mtype}: {me}", exc_info=True)
     except WebSocketDisconnect:
         log.info(f"[WS] close sid={s.id}")
         engine.cancel(s.id)
