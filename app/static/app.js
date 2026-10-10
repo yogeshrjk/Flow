@@ -6,6 +6,7 @@ let state = 'IDLE';
 let recog = null, vad = null, audioQ = new AudioQueue();
 let listening = false, aiSpeaking = false, muted = false, running = false;
 let micMuted = false, captionsOn = true;
+let llmPending = false;
 let fullReply = '';
 let userWords = 0, userTurns = 0, sessStart = 0, clockTimer = null;
 let speechTimer = null;
@@ -1283,6 +1284,7 @@ function handleServerMessage(m) {
   else if (m.type === 'status') {
     setState(m.state, m.note);
     if (m.state === 'THINKING' || m.state === 'SPEAKING') {
+      llmPending = true;
       if (!$('aiTyping')) showTypingIndicator();
     }
   }
@@ -1301,6 +1303,7 @@ function handleServerMessage(m) {
   }
   else if (m.type === 'tts_start_hint') {
     fullReply = '';
+    llmPending = true;
     if (audioQ.engine === 'gemini') { try { LiveCaptions.start(); } catch (e) {} }
     setState('SPEAKING');
     if (!$('aiTyping')) showTypingIndicator();
@@ -1320,6 +1323,7 @@ function handleServerMessage(m) {
     log(`[LLM req_id=${reqId}] LLM response received in client (chars=${(m.text || '').length})`);
     hideTypingIndicator();
     fullReply = '';
+    llmPending = false;
     const displayText = m.display_text || m.text;
     // Live center line mirrors the voice: latest chunk only (fish path keeps
     // its own per-sentence display and is untouched by liveChunkText).
@@ -1341,19 +1345,27 @@ function handleServerMessage(m) {
     }
     if (m.correction && m.correction.length) log('[COACH]', JSON.stringify(m.correction));
     if (!audioQ.busy) {
+      aiSpeaking = false;
       if (!m.partial && state !== 'INTERRUPTED') {
         setAiLine(centerText);
         smokeDissolveAiLine(1400);
       }
-      if (running && state !== 'INTERRUPTED') setState('LISTENING');
+      if (running && state !== 'INTERRUPTED') {
+        setState('LISTENING');
+      }
     }
   } else if (m.type === 'llm_cancelled') {
     const reqId = m.req_id || m.turn || String(turnSeq);
     log(`[TURN req_id=${reqId}] turn cancelled`);
     hideTypingIndicator();
     fullReply = '';
+    llmPending = false;
+    aiSpeaking = false;
     try { LiveCaptions.stop(); } catch (e) {}
     setAiLine('');
+    if (running && !audioQ.busy) {
+      setState('LISTENING');
+    }
   }
   else if (m.type === 'mode') {
     if ($('mode') && (m.mode === 'free' || m.mode === 'practice')) {
@@ -1369,9 +1381,13 @@ function handleServerMessage(m) {
   }
   else if (m.type === 'error') {
     const reqId = m.req_id || m.turn || String(turnSeq);
+    llmPending = false;
     hideTypingIndicator();
     log(`[ERROR req_id=${reqId}] stage=${m.stage || m.scope || 'unknown'} error=${sanitizeError(m.message)}`);
-    if (running) setState('LISTENING');
+    if (running && !audioQ.busy) {
+      aiSpeaking = false;
+      setState('LISTENING');
+    }
   }
 }
 
@@ -1464,8 +1480,15 @@ async function connect() {
     setState('SPEAKING');
   };
   audioQ.onDrained = () => {
-    if (running) setState('LISTENING'); else setState('IDLE');
-    smokeDissolveAiLine(1400);
+    if (!llmPending) {
+      aiSpeaking = false;
+      if (running && state !== 'INTERRUPTED') {
+        setState('LISTENING');
+      } else if (!running) {
+        setState('IDLE');
+      }
+      smokeDissolveAiLine(1400);
+    }
   };
   audioQ.onSentenceStart = (text) => { setAiLine(text); };
   audioQ.onFirstAudio = (info) => logLatency(info);
@@ -1610,6 +1633,8 @@ async function sendText(text) {
     try { httpTurnAbortController.abort(); } catch (e) {}
     httpTurnAbortController = null;
   }
+  llmPending = true;
+  aiSpeaking = true;
   lastSentText = text; lastSentAt = performance.now();
   addTurn('You', text);
   showTypingIndicator();
@@ -1664,13 +1689,13 @@ function setupRecog() {
   const r = new SR();
   r.lang = sttLang;
   r.interimResults = true;
-  // Keep mobile capture open across utterances; onend below remains a recovery path
-  // for browsers that terminate continuous recognition on their own.
+  // Always continuous capture: keep mic stream active without automatic cycling
   r.continuous = true;
   r.maxAlternatives = 1;
   recogFatal = false;
   consecutiveAborts = 0;
   clearTimeout(recogRestartTimer);
+  recogRestartTimer = null;
 
   r.onspeechstart = () => {
     if (micMuted || !listening) return;
@@ -1698,7 +1723,7 @@ function setupRecog() {
   };
 
   r.onresult = (ev) => {
-    if (micMuted || !listening) return; // deaf while mic-muted: no turns, no interrupts
+    if (micMuted || !listening) return; // deaf only while mic is explicitly muted
     consecutiveAborts = 0;
     let interim = '', fin = '', conf = 1;
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
@@ -1751,7 +1776,7 @@ function setupRecog() {
       listening = false;
       hearNote('Mic blocked — allow microphone access, then press mic again.');
     } else if (e.error === 'no-speech') {
-      // transient silence on mobile — normal, onend restarts smoothly
+      // transient silence on mobile — normal, onend keeps mic open seamlessly
     } else if (e.error === 'aborted') {
       // aborted by hardware contention or turn change
     } else if (e.error === 'network') {
@@ -1766,25 +1791,30 @@ function setupRecog() {
     consecutiveAborts = 0;
     log('[STT] mic stream opened');
   };
-  r.onaudioend = () => log('[STT] mic stream closed');
+  r.onaudioend = () => {
+    log('[STT] mic stream closed');
+  };
   r.onend = () => {
-    if (listening && running && !micMuted && !recogFatal) {
-      clearTimeout(recogRestartTimer);
-      const delay = consecutiveAborts > 2 ? 1500 : (isMobile ? 180 : 350);
-      recogRestartTimer = setTimeout(() => {
-        if (listening && running && !micMuted && !recogFatal) {
-          try {
-            r.start();
-          } catch (e) {
-            setTimeout(() => {
-              if (listening && running && !recogFatal) {
-                try { r.start(); } catch (err) {}
-              }
-            }, isMobile ? 350 : 600);
+    // Only restart if recognition was externally stopped (fatal error, user action, or barge-in)
+    // Do NOT auto-restart on natural mobile onend events (silence, no-speech) to prevent mic cycling
+    if (!listening || !running || micMuted || recogFatal) {
+      return; // intentionally stopped
+    }
+    
+    // Debounced restart with longer delay to prevent rapid cycling on mobile
+    clearTimeout(recogRestartTimer);
+    recogRestartTimer = setTimeout(() => {
+      if (listening && running && !micMuted && !recogFatal) {
+        try {
+          r.start();
+          log('[STT] recognition restarted after natural end');
+        } catch (err) {
+          if (err.name !== 'InvalidStateError') {
+            log('[STT] restart failed:', err.message);
           }
         }
-      }, delay);
-    }
+      }
+    }, 500); // 500ms debounce to prevent rapid restart loops on mobile
   };
   return r;
 }
@@ -1870,7 +1900,33 @@ function micTestErrorMessage(error) {
   return 'Mic test failed: ' + name;
 }
 
+function resumeSTT() {
+  if (!recog || recogFatal || micMuted) return;
+  listening = true;
+  try {
+    recog.start();
+    log('[STT] mic stream opened');
+  } catch (e) {
+    if (e.name !== 'InvalidStateError') {
+      log('[STT] start failed:', e.name);
+    }
+  }
+}
+
+function pauseSTT() {
+  listening = false;
+  if (!recog) return;
+  try {
+    recog.stop();
+    log('[STT] mic stream closed');
+  } catch (e) {
+    log('[STT] stop failed:', e.name);
+  }
+}
+
 function bargeIn() {
+  llmPending = false;
+  aiSpeaking = false;
   audioQ.cancel();
   if (httpTurnAbortController) {
     try { httpTurnAbortController.abort(); } catch (e) {}
@@ -1882,7 +1938,12 @@ function bargeIn() {
   setAiLine('');
   try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'barge_in' })); } catch (e) {}
   fullReply = '';
-  setTimeout(() => { if (state === 'INTERRUPTED') setState('LISTENING'); }, 600);
+  setTimeout(() => {
+    if (state === 'INTERRUPTED') {
+      setState('LISTENING');
+      resumeSTT();
+    }
+  }, 400);
 }
 
 function sustainedBargeIn() {
@@ -1898,6 +1959,8 @@ function sustainedBargeIn() {
 
 async function startSession() {
   running = true;
+  llmPending = false;
+  aiSpeaking = false;
   await audioQ.unlock();
   await connect();
   if ($('topbar')) $('topbar').classList.remove('hidden');
@@ -1934,12 +1997,7 @@ async function startSession() {
 
   recog = setupRecog();
   if (recog) {
-    listening = true;
-    try {
-      recog.start();
-    } catch (e) {
-      log('[STT] start failed', e);
-    }
+    resumeSTT();
   }
   log('[VAD] always-listening ON • auto-interrupt ON • STT ' + sttLang + ' • [TTS] Fish S2.1 Pro Free');
   if (!window.__micLiveTimer) {
@@ -1955,8 +2013,10 @@ async function startSession() {
 function stopSession() {
   running = false;
   listening = false;
+  llmPending = false;
+  aiSpeaking = false;
   recogFatal = true;
-  clearTimeout(recogRestartTimer);
+  pauseSTT();
   lastInterim = ''; lastInterimAt = 0; awaitingFinal = false; lastSentText = '';
   userSaid('');
   try { LiveCaptions.stop(); } catch (e) {}
@@ -2001,7 +2061,7 @@ $('micMuteBtn').onclick = (e) => {
     lastInterim = '';
     lastInterimAt = 0;
     awaitingFinal = false;
-    try { recog && recog.abort(); } catch (err) {}
+    pauseSTT();
     $('micLive').classList.remove('on');
     hearNote('Mic muted — I cannot hear you.');
   } else {
@@ -2009,8 +2069,8 @@ $('micMuteBtn').onclick = (e) => {
     lastInterimAt = 0;
     awaitingFinal = false;
     hearNote('');
-    if (recog && listening && running) {
-      try { recog.start(); } catch (err) {}
+    if (running && !isTurnActive()) {
+      resumeSTT();
     }
   }
   setIcon($('micMuteBtn'), micMuted ? 'mic-off' : 'mic');

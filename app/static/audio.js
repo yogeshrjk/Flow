@@ -25,6 +25,7 @@ class AudioQueue {
     this._pcmTurn = ''; // live turn id these PCM stats belong to
     this._pcmRecvSec = 0; // total PCM audio seconds received this turn
     this._pcmPlayStart = 0; // ctx.currentTime when this turn's first chunk plays
+    this._activePlayTimer = null;
   }
   setMuted(m) {
     this.muted = !!m;
@@ -81,8 +82,19 @@ class AudioQueue {
     // turn dead so they are dropped instead of starting to speak again
     if (this._turnId) this.deadTurns.add(this._turnId);
     if (this.deadTurns.size > 24) this.deadTurns = new Set([...this.deadTurns].slice(-8));
-    try { this.currentAudio && this.currentAudio.pause(); } catch (e) {}
-    this.currentAudio = null;
+    if (this._activePlayTimer) {
+      clearTimeout(this._activePlayTimer);
+      this._activePlayTimer = null;
+    }
+    if (this.currentAudio) {
+      try {
+        this.currentAudio.onended = null;
+        this.currentAudio.onerror = null;
+        this.currentAudio.onplaying = null;
+        this.currentAudio.pause();
+      } catch (e) {}
+      this.currentAudio = null;
+    }
     this._stopStream(); // kills the progressive <audio> request too
     for (const ac of this._aborts) { try { ac.abort(); } catch (e) {} }
     this._aborts.clear();
@@ -254,17 +266,26 @@ class AudioQueue {
       if (this.cancelled) return resolve({ ok: false, reason: 'cancelled' });
       this._playResolve = resolve;
       let done = false;
-      const settle = (v) => { if (!done) { done = true; this._playResolve = null; resolve(v); } };
-      const timer = setTimeout(() => {
+      let timer = null;
+      const settle = (v) => {
+        if (!done) {
+          done = true;
+          if (timer) { clearTimeout(timer); timer = null; }
+          if (this._activePlayTimer === timer) this._activePlayTimer = null;
+          this._playResolve = null;
+          resolve(v);
+        }
+      };
+      timer = setTimeout(() => {
         this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=AUDIO_PLAYBACK error=playback timeout`);
         settle({ ok: false, reason: 'playback timeout' });
       }, 45000);
+      this._activePlayTimer = timer;
       const a = new Audio(url);
       a.muted = this.muted;
       this.currentAudio = a;
-      a.onended = () => { clearTimeout(timer); settle({ ok: true }); };
+      a.onended = () => { settle({ ok: true }); };
       a.onerror = () => {
-        clearTimeout(timer);
         this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=AUDIO_PLAYBACK error=audio decode error`);
         settle({ ok: false, reason: 'audio decode error' });
       };
@@ -289,7 +310,6 @@ class AudioQueue {
             setTimeout(() => attempt(n + 1), 300);
           } else {
             triggerStart();
-            clearTimeout(timer);
             this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=AUDIO_PLAYBACK error=${reason}`);
             settle({ ok: false, reason });
           }
@@ -306,15 +326,25 @@ class AudioQueue {
       if (this.cancelled) return resolve({ ok: false, reason: 'cancelled' });
       this._playResolve = resolve;
       let done = false, dataAt = 0, started = false;
-      const settle = (v) => { if (!done) { done = true; this._playResolve = null; resolve(v); } };
+      let timer = null;
+      const settle = (v) => {
+        if (!done) {
+          done = true;
+          if (timer) { clearTimeout(timer); timer = null; }
+          if (this._activePlayTimer === timer) this._activePlayTimer = null;
+          this._playResolve = null;
+          resolve(v);
+        }
+      };
       // 20s: a suspended/background tab defers media start — surfacing that as
       // a failure quickly is better than a 45s dead wait, and the caller retries
       // through the download path
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         this._stopStream();
         this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_STREAM error=playback timeout`);
         settle({ ok: false, reason: 'playback timeout' });
       }, 20000);
+      this._activePlayTimer = timer;
       const a = new Audio();
       a.muted = this.muted;
       this.currentAudio = a;
@@ -336,9 +366,8 @@ class AudioQueue {
         // n/a rather than a fake 0ms
         this._reportFirstAudio(dataAt || null, tReq, true, turn);
       };
-      a.onended = () => { clearTimeout(timer); settle({ ok: true }); };
+      a.onended = () => { settle({ ok: true }); };
       a.onerror = () => {
-        clearTimeout(timer);
         this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_STREAM error=tts stream failed`);
         settle({ ok: false, reason: 'tts stream failed' });
       };
@@ -350,7 +379,6 @@ class AudioQueue {
         a.play().catch((e) => {
           if (n < 1 && !this.cancelled) setTimeout(() => attempt(n + 1), 200);
           else {
-            clearTimeout(timer);
             const reason = (e && e.name) || 'play rejected';
             this._log(`[ERROR req_id=${reqId || 'n/a'}] stage=TTS_STREAM error=${reason}`);
             settle({ ok: false, reason });
@@ -364,7 +392,14 @@ class AudioQueue {
     const a = this._streamEl;
     this._streamEl = null;
     if (!a) return;
-    try { a.pause(); } catch (e) {}
+    try {
+      a.onended = null;
+      a.onerror = null;
+      a.onplaying = null;
+      a.onprogress = null;
+      a.onloadedmetadata = null;
+      a.pause();
+    } catch (e) {}
     try { a.removeAttribute('src'); a.load(); } catch (e) {} // aborts the in-flight request
   }
   _reportFirstAudio(tReady, tReq, streamed, turn) {
