@@ -5,7 +5,7 @@ import logging
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.conversation.engine import engine
+from app.conversation.prompts import LANGUAGES, LANGUAGE_STT_CODES
 from app.coaching.roleplay import SCENARIOS, today_challenge
 from app.coaching.memory import load_profile
 from app.providers.tts.fish import FishProvider
@@ -78,9 +79,8 @@ async def api_config():
         "default_response_mode": settings.default_response_mode,
         "tts": "fish-s2.1-pro-free",
         "languages": [
-            {"id": "english", "label": "English", "stt": "en-IN"},
-            {"id": "hindi", "label": "Hindi", "stt": "hi-IN"},
-            {"id": "hinglish", "label": "Hinglish", "stt": "en-IN"},
+            {"id": lid, "label": disp, "stt": LANGUAGE_STT_CODES.get(lid, "en-IN")}
+            for lid, disp in LANGUAGES.items()
         ],
         "fish_voices": FISH_VOICES,
         "fish_library_languages": [
@@ -92,6 +92,7 @@ async def api_config():
         "fish_key_set": settings.has_fish,
         "gemini_key_set": settings.has_gemini,
         "stt": "browser (free)",
+        "server_stt": settings.has_groq,
         "modes": ["free", "practice"],
         "scenarios": [{"id": k, **v} for k, v in SCENARIOS.items()],
     }
@@ -231,6 +232,187 @@ async def tts_test(voice: str = "", engine: str = ""):
     return await tts(TTSReq(text="Hey! This is a Fish Audio voice test. How do I sound?", voice=vid, engine="fish"))
 
 
+@app.post("/api/stt")
+async def stt_transcribe(request: Request):
+    """Transcribe one recorded utterance (raw audio bytes in the body).
+
+    Lets mobile hold ONE mic stream open for the whole session: the client
+    records on its held getUserMedia stream and POSTs each utterance here
+    instead of relying on Web Speech, whose platform-owned stream auto-ends
+    on silence/utterance boundaries. Optional `X-Language` header (`en`/`hi`)
+    only picks the prompt sample as a script hint — the spoken language is
+    always auto-detected from the audio.
+    """
+    from app.providers.stt.groq_whisper import MAX_AUDIO_BYTES, GroqWhisperSTT
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "audio/" not in ctype and "video/webm" not in ctype:
+        return JSONResponse({"error": "send raw audio bytes with an audio Content-Type"}, status_code=415)
+    provider = GroqWhisperSTT()
+    if not provider.available:
+        return JSONResponse({"error": "server transcription unavailable"}, status_code=503)
+    data = await request.body()
+    if not data or len(data) < 1024:
+        return JSONResponse({"error": "empty audio"}, status_code=400)
+    if len(data) > MAX_AUDIO_BYTES:
+        return JSONResponse({"error": "audio too large"}, status_code=413)
+    lang = (request.headers.get("x-language") or "").strip().lower()[:16]
+    lang = lang if lang in LANGUAGES else None
+    fname = (request.headers.get("x-filename") or "").strip()[-40:] or "utterance.webm"
+    fname = "".join(c for c in fname if c.isalnum() or c in (".", "-", "_")) or "utterance.webm"
+    # forward the real container type: Groq sniffs content AND the part type,
+    # so a hardcoded webm here rejects Safari mp4 recordings.
+    ftype = ctype.split(";")[0].strip() or "audio/webm"
+    # Always auto-detect the spoken language: forcing `en` on Hindi speech
+    # mangles it ("kal" -> "kil") and a Hindi prompt on English speech hijacks
+    # the output — both verified live. X-Language only picks the prompt
+    # sample (a script hint for short/ambiguous utterances); detection itself
+    # follows the audio and wins on clear speech either way.
+    log.info(f"[STT] transcribe request bytes={len(data)} hint={lang or 'auto'}")
+    sid = (request.headers.get("x-session") or "").strip()[:32]
+    raw_level = request.headers.get("x-level")
+    try:
+        # Absent header (older clients) means "unknown" — skip the energy rule;
+        # an explicit low reading means the mic captured no real speech.
+        peak = float(raw_level.strip()) if raw_level is not None else None
+    except (ValueError, AttributeError):
+        peak = None
+    prompt, context = _stt_prompt(lang, sid)
+    text, err, detected = await provider.transcribe(data, filename=fname, language=None, content_type=ftype, prompt=prompt)
+    if err:
+        log.warning(f"[STT] transcribe failed: {err[:120]}")
+        return JSONResponse({"error": err}, status_code=502)
+    if _looks_hallucinated(text, context, peak):
+        log.warning(f"[STT] hallucinated transcript dropped peak={peak}: {text[:80]}")
+        return JSONResponse({"error": "I didn't catch that — say it once more?"}, status_code=502)
+    if (request.headers.get("x-barged") or "").strip() == "1" and _is_echo_of_assistant(text, sid):
+        log.warning(f"[STT] speaker-echo transcript dropped: {text[:80]}")
+        return JSONResponse({"error": "I didn't catch that — say it once more?"}, status_code=502)
+    log.info(f"[STT] transcript ok detected={detected} hint={lang or 'auto'}")
+    if sid and detected and sid in engine.sessions:
+        try:
+            engine.sessions[sid].last_spoken_lang = detected
+        except Exception:
+            pass
+    return {"text": text, "language": detected}
+
+
+# Classic Whisper-on-noise signatures: looped words, caption-site junk, or the
+# prompt parroted back on silence. Real short replies ("haan", "yes") never
+# match: the repetition rule needs 4+ words and the parrot rule 3+.
+_STT_JUNK_PHRASES = (
+    "thanks for watching", "thank you for watching", "subscribe",
+    "transcription by", "amara.org", "http://", "https://", "www.",
+)
+
+
+def _word_overlap(a: str, b: str) -> float:
+    aw = [w for w in a.lower().split() if w]
+    if not aw:
+        return 0.0
+    bw = set(b.lower().split())
+    hit = sum(1 for w in aw if w in bw)
+    return hit / len(aw)
+
+
+def _looks_hallucinated(text: str, context: str, peak: float | None) -> bool:
+    words = (text or "").split()
+    if not words:
+        return True
+    low = text.lower()
+    if any(p in low for p in _STT_JUNK_PHRASES):
+        return True
+    if len(words) >= 4 and len({w.lower() for w in words}) / len(words) < 0.4:
+        return True
+    if context and len(words) >= 3 and _word_overlap(text, context) >= 0.9:
+        return True
+    if peak is not None and peak < 0.010 and len(words) <= 2:
+        return True
+    return False
+
+
+def _is_echo_of_assistant(text: str, sid: str) -> bool:
+    """True when a barge-time transcript just repeats what the AI just said:
+    speaker echo leaking past cancellation, not the user speaking."""
+    words = (text or "").split()
+    if len(words) < 4 or not sid:
+        return False
+    try:
+        from app.conversation.engine import engine as _eng
+
+        turns = _eng.sessions.get(sid, None)
+        history = (turns.turns if turns else [])
+        last_ai = ""
+        for t in reversed(history):
+            if t.get("role") == "assistant" and (t.get("text") or "").strip():
+                last_ai = t["text"]
+                break
+        if not last_ai:
+            return False
+        return _word_overlap(text, last_ai) >= 0.8
+    except Exception:
+        return False
+
+
+# Whisper prompt: a short sample in the user's PREFERRED language (their
+# setting) plus recent turns. The sample is load-bearing for short
+# utterances ("haan" with no sample came back "Huh?"), and detection always
+# follows the audio, so a preferred-language sample never blocks another
+# language — it only steers ambiguous shorts toward the preferred script.
+# Capped short — long prompts get truncated server-side anyway.
+_STT_SAMPLES = {
+    "english": "Hey, how are you doing today? I'm doing well, thanks for asking.",
+    "hindi": "नमस्ते, आप कैसे हैं? मैं बिल्कुल ठीक हूँ, धन्यवाद।",
+    "spanish": "Hola, ¿cómo estás hoy? Estoy muy bien, gracias por preguntar.",
+    "french": "Bonjour, comment vas-tu aujourd'hui ? Je vais très bien, merci.",
+    "german": "Hallo, wie geht es dir heute? Mir geht es gut, danke.",
+    "portuguese": "Olá, como você está hoje? Estou bem, obrigado por perguntar.",
+    "italian": "Ciao, come stai oggi? Sto bene, grazie.",
+    "dutch": "Hallo, hoe gaat het vandaag? Met mij gaat het goed, bedankt.",
+    "russian": "Привет, как дела сегодня? У меня всё хорошо, спасибо.",
+    "japanese": "こんにちは、今日はお元気ですか？元気です、ありがとう。",
+    "korean": "안녕하세요, 오늘 어떻게 지내세요? 잘 지내고 있어요, 감사합니다.",
+    "chinese": "你好，今天怎么样？我很好，谢谢。",
+    "arabic": "مرحبا، كيف حالك اليوم؟ أنا بخير، شكرا لسؤالك.",
+    "tamil": "வணக்கம், இன்று எப்படி இருக்கிறீர்கள்? நான் நன்றாக இருக்கிறேன், நன்றி.",
+    "telugu": "నమస్కారం, ఈరోజు ఎలా ఉన్నారు? నేను బాగున్నాను, ధన్యవాదాలు.",
+    "bengali": "নমস্কার, আজ কেমন আছেন? আমি ভালো আছি, ধন্যবাদ।",
+    "marathi": "नमस्कार, आज कसे आहात? मी ठीक आहे, धन्यवाद.",
+    "urdu": "ہیلو، آج آپ کیسے ہیں؟ میں ٹھیک ہوں، پوچھنے کا شکریہ.",
+}
+
+
+def _stt_prompt(lang: str | None, sid: str) -> tuple[str, str]:
+    """Return (whisper prompt, session context). Context is also returned
+    separately so the hallucination filter can spot prompt-parroting.
+    Samples steer short/ambiguous utterances; when the user recently spoke a
+    different language than their preferred one, that language's sample rides
+    along too — switchers stay covered without any extra round trip."""
+    context = ""
+    last_spoken = ""
+    if sid:
+        try:
+            from app.conversation.engine import engine as _eng
+
+            sess = _eng.sessions.get(sid, None)
+            recent = (sess.turns if sess else [])[-3:]
+            context = " / ".join(
+                str((t.get("text") or "")).strip()[:100] for t in recent
+                if (t.get("text") or "").strip()
+            ).strip()
+            if sess and getattr(sess, "last_spoken_lang", ""):
+                last_spoken = sess.last_spoken_lang
+        except Exception:
+            context = ""
+    parts = []
+    if lang in _STT_SAMPLES:
+        parts.append(_STT_SAMPLES[lang])
+    if last_spoken and last_spoken != lang and last_spoken in _STT_SAMPLES:
+        parts.append(_STT_SAMPLES[last_spoken])
+    if context:
+        parts.append(context)
+    return " ".join(parts)[:300], context
+
+
 class TurnReq(BaseModel):
     text: str
     mode: str = "free"
@@ -244,6 +426,7 @@ class TurnReq(BaseModel):
     t0: float | None = None
     turn_id: str = ""
     req_id: str = ""
+    reply_lang: str = ""  # detected spoken language for THIS turn; reply follows it
 
 
 @app.post("/api/session/{sid}/turn")
@@ -261,7 +444,7 @@ async def api_turn(req: TurnReq, sid: str = "default"):
         s.correction = req.correction
     if req.level:
         s.level_setting = req.level
-    if req.language in ("english", "hindi", "hinglish"):
+    if req.language in LANGUAGES:
         s.language = req.language
     if req.voice_id:
         s.voice_id = req.voice_id
@@ -282,7 +465,8 @@ async def api_turn(req: TurnReq, sid: str = "default"):
     async def event_generator():
         turn_task = asyncio.create_task(engine.handle_user_turn(
             s, req.text, sse_send, t0,
-            t_speech_end_ms=req.t0, turn_id=turn_id, req_id=req_id
+            t_speech_end_ms=req.t0, turn_id=turn_id, req_id=req_id,
+            reply_lang=req.reply_lang,
         ))
         try:
             while not turn_task.done() or not queue.empty():
@@ -330,7 +514,7 @@ async def ws_session(ws: WebSocket, sid: str, lang: str = ""):
     await ws.accept()
     s = engine.get_or_create(sid)
     lang = (lang or "").lower()
-    if lang in ("english", "hindi", "hinglish"):
+    if lang in LANGUAGES:
         s.language = lang
     log.info(f"[WS] open sid={s.id}")
     await ws.send_json({"type": "ready", "session_id": s.id, "mode": s.mode,
@@ -363,7 +547,8 @@ async def ws_session(ws: WebSocket, sid: str, lang: str = ""):
                     req_id = str(msg.get("req_id") or turn_id or s.id)
                     task = asyncio.create_task(engine.handle_user_turn(
                         s, msg.get("text", ""), send, t0,
-                        t_speech_end_ms=msg.get("t0"), turn_id=turn_id, req_id=req_id))
+                        t_speech_end_ms=msg.get("t0"), turn_id=turn_id, req_id=req_id,
+                        reply_lang=str(msg.get("reply_lang", ""))))
                     engine.tasks[s.id] = task
                     # never await here: the receive loop must keep reading, otherwise a
                     # barge_in (or the next turn) can't cancel this turn mid-reply
@@ -395,7 +580,7 @@ async def ws_session(ws: WebSocket, sid: str, lang: str = ""):
                     await send({"type": "level", "value": s.level_setting})
                 elif mtype == "set_language":
                     lang = str(msg.get("value", "english")).lower()
-                    if lang in ("english", "hindi", "hinglish"):
+                    if lang in LANGUAGES:
                         s.language = lang
                         await send({"type": "language", "value": s.language})
                 elif mtype == "set_response_mode":

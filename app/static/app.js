@@ -1,5 +1,6 @@
 /* Always-listening client: mic open from Start, auto-interrupt always on.
    mic -> local VAD -> WebSpeech STT (en-IN) -> WS -> streaming LLM -> Fish TTS. */
+const APP_BUILD = 111; // bump with every app.js change; printed on session start so bug reports identify the build
 const $ = (id) => document.getElementById(id);
 let ws = null, sid = 's' + Math.random().toString(36).slice(2, 8);
 let state = 'IDLE';
@@ -11,7 +12,7 @@ let fullReply = '';
 let userWords = 0, userTurns = 0, sessStart = 0, clockTimer = null;
 let speechTimer = null;
 let userFadeTimer = null;
-let sttLang = 'en-IN'; // follows Language setting: english/hinglish=en-IN, hindi=hi-IN
+let sttLang = 'en-IN'; // BCP-47 code for the browser-STT fallback; follows the preferred language
 // instant-turn state: commit on speech-end using the interim transcript instead
 // of waiting ~1s for the STT engine to finalize
 let lastInterim = '', lastInterimAt = 0, awaitingFinal = false;
@@ -92,6 +93,44 @@ function labelFor(id) {
   return respModeLabel;
 }
 let serverConfig = null;
+
+// Preferred-language picker, driven by /api/config (18 languages). The pick
+// is only the DEFAULT: every turn answers in whatever language was actually
+// spoken (server-side detection), falling back to this.
+const LANG_FALLBACK = [
+  { id: 'english', label: 'English', stt: 'en-IN' },
+  { id: 'hindi', label: 'Hindi', stt: 'hi-IN' },
+];
+function serverLanguages() {
+  try {
+    const list = serverConfig && serverConfig.languages;
+    if (Array.isArray(list) && list.length) return list;
+  } catch (e) {}
+  return LANG_FALLBACK;
+}
+function sttCodeFor(langId) {
+  const found = serverLanguages().filter(l => l.id === langId)[0];
+  return (found && found.stt) || 'en-IN';
+}
+function renderLanguageOptions(cfg) {
+  const sel = $('language');
+  if (!sel) return;
+  const langs = (cfg && Array.isArray(cfg.languages) && cfg.languages.length)
+    ? cfg.languages : LANG_FALLBACK;
+  let saved = 'english';
+  try { saved = localStorage.getItem('lang') || 'english'; } catch (e) {}
+  if (saved === 'hinglish') saved = 'english'; // retired option: multilingual detection covers the mix
+  if (!langs.some(l => l.id === saved)) saved = 'english';
+  sel.innerHTML = '';
+  langs.forEach(l => {
+    const o = document.createElement('option');
+    o.value = l.id;
+    o.textContent = l.label || l.id;
+    sel.appendChild(o);
+  });
+  sel.value = saved;
+  sttLang = sttCodeFor(saved);
+}
 
 function updateVoiceDropdown() {
   const v = $('voice');
@@ -1265,6 +1304,7 @@ async function loadConfig() {
 
     renderResponseModes(cfg);
     updateVoiceDropdown();
+    renderLanguageOptions(cfg);
     initializeFishLibrary(cfg.fish_library_languages || []);
   } catch (e) {
     const fs = $('fishStatus');
@@ -1391,7 +1431,7 @@ function handleServerMessage(m) {
   }
 }
 
-async function streamHttpTurn(text, turnId, reqId) {
+async function streamHttpTurn(text, turnId, reqId, replyLang) {
   if (httpTurnAbortController) {
     try { httpTurnAbortController.abort(); } catch (e) {}
   }
@@ -1410,7 +1450,8 @@ async function streamHttpTurn(text, turnId, reqId) {
     history: getStoredChatHistory().slice(-10).map(x => ({ role: x.who === 'You' ? 'user' : 'assistant', content: x.text })),
     t0: Date.now(),
     turn_id: turnId,
-    req_id: reqId
+    req_id: reqId,
+    reply_lang: replyLang || ''
   };
 
   try {
@@ -1517,9 +1558,9 @@ async function connect() {
     log('[WS] connected', sid);
     try {
       const saved = localStorage.getItem('lang');
-      if (saved && STT_LANGS[saved]) {
+      if (saved && serverLanguages().some(l => l.id === saved)) {
         $('language').value = saved;
-        applyLanguage(saved);
+        applyLanguage(saved, true);
       }
     } catch (e) {}
     // sync current mode, scenario, correction, and level to session
@@ -1619,7 +1660,7 @@ function sameText(a, b, thr = 0.75) {
   for (const w of ys) if (xs.has(w)) hit++;
   return hit / Math.max(ys.length, 1) >= thr;
 }
-async function sendText(text) {
+async function sendText(text, replyLang) {
   text = (text || '').trim();
   if (!text) return;
 
@@ -1658,9 +1699,9 @@ async function sendText(text) {
   log(`[CHAT req_id=${reqId}] text submission started: "${text.slice(0, 80)}" (${transportLabel})`);
 
   if (useHttpTransport || !ws || ws.readyState !== WebSocket.OPEN) {
-    streamHttpTurn(text, turnId, reqId);
+    streamHttpTurn(text, turnId, reqId, replyLang || '');
   } else {
-    ws.send(JSON.stringify({ type: 'user_transcript', text, t0: Date.now(), turn_id: turnId, req_id: reqId }));
+    ws.send(JSON.stringify({ type: 'user_transcript', text, t0: Date.now(), turn_id: turnId, req_id: reqId, reply_lang: replyLang || '' }));
   }
 }
 const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || ('ontouchstart' in window && window.innerWidth < 800);
@@ -1682,6 +1723,12 @@ function commitTurnIfReady() {
 let recogRestartTimer = null;
 let recogFatal = false;
 let consecutiveAborts = 0;
+// Mobile browsers auto-end SpeechRecognition on silence/utterance boundaries
+// even with continuous=true (iOS ignores continuous entirely), so onend fires
+// on its own and each cycle logs open/close. Track end spacing to back off
+// when the platform is throttling restarts instead of hammering start().
+let lastRecogEndAt = 0;
+let recogRapidEnds = 0;
 
 function setupRecog() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -1689,11 +1736,15 @@ function setupRecog() {
   const r = new SR();
   r.lang = sttLang;
   r.interimResults = true;
-  // Always continuous capture: keep mic stream active without automatic cycling
+  // Hint only: mobile browsers still auto-end on silence/utterance boundaries
+  // (iOS ignores continuous entirely) — onend below reopens with debounce.
   r.continuous = true;
-  r.maxAlternatives = 1;
+  // Best-confidence alternative wins, in every language.
+  r.maxAlternatives = 3;
   recogFatal = false;
   consecutiveAborts = 0;
+  lastRecogEndAt = 0;
+  recogRapidEnds = 0;
   clearTimeout(recogRestartTimer);
   recogRestartTimer = null;
 
@@ -1728,8 +1779,26 @@ function setupRecog() {
     let interim = '', fin = '', conf = 1;
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const res = ev.results[i];
-      if (res.isFinal) { fin += res[0].transcript; conf = Math.min(conf, res[0].confidence || 0.9); }
-      else interim += res[0].transcript;
+      if (res.isFinal) {
+        // Check all alternatives and pick the highest-confidence one.
+        if (res.length > 1) {
+          let bestTranscript = res[0].transcript;
+          let bestConf = res[0].confidence || 0.9;
+          for (let alt = 1; alt < res.length; alt++) {
+            const altConf = res[alt].confidence || 0.9;
+            if (altConf > bestConf) {
+              bestTranscript = res[alt].transcript;
+              bestConf = altConf;
+            }
+          }
+          fin += bestTranscript;
+          conf = Math.min(conf, bestConf);
+        } else {
+          fin += res[0].transcript; conf = Math.min(conf, res[0].confidence || 0.9);
+        }
+      } else {
+        interim += res[0].transcript;
+      }
     }
     if (interim) {
       lastInterim = interim; lastInterimAt = performance.now();
@@ -1740,12 +1809,19 @@ function setupRecog() {
     }
     if (fin && fin.trim()) {
       const text = fin.trim();
+      
+      // For Hindi: stricter filtering due to lower model quality
+      const minConfThreshold = isHindi ? 0.35 : 0.25;
+      const minLengthThreshold = isHindi ? 3 : 2;
+      
       // room noise / stray fragments: low confidence AND near-empty
-      if (conf < 0.25 && text.length < 2) {
+      if (conf < minConfThreshold && text.length < minLengthThreshold) {
         log('[STT] dropped as noise', JSON.stringify(text), 'conf=' + conf.toFixed(2));
+        if (isHindi) hearNote('कृपया फिर से बोलें (Please speak again)');
         lastInterim = '';
         return;
       }
+      
       // if already answered from VAD speech-end commit:
       if (awaitingFinal) {
         log('[STT] final matched early commit — suppressing duplicate');
@@ -1760,7 +1836,15 @@ function setupRecog() {
       lastInterimAt = 0;
       userSaid(text);
       log('[STT] final', JSON.stringify(text.slice(0, 100)), 'conf=' + conf.toFixed(2));
-      if (conf < 0.35) hearNote('I did not catch that clearly — say it once more?');
+      
+      // Warn user about low confidence - more lenient for Hindi
+      const warnThreshold = isHindi ? 0.45 : 0.35;
+      if (conf < warnThreshold) {
+        const msg = isHindi 
+          ? 'मुझे सही से समझ नहीं आया — कृपया फिर से बोलें (I did not catch that clearly — please speak again)'
+          : 'I did not catch that clearly — say it once more?';
+        hearNote(msg);
+      }
       sendText(text);
     }
   };
@@ -1795,26 +1879,46 @@ function setupRecog() {
     log('[STT] mic stream closed');
   };
   r.onend = () => {
-    // Only restart if recognition was externally stopped (fatal error, user action, or barge-in)
-    // Do NOT auto-restart on natural mobile onend events (silence, no-speech) to prevent mic cycling
+    // Mobile browsers end recognition on their own (silence endpointing,
+    // single-utterance mode on iOS, audio-focus/power management) even though
+    // we never call stop() mid-session and continuous=true. Each auto-end
+    // closes the mic stream (onaudioend), so the open/close pair in the log
+    // is the platform lifecycle, not a leak. Reopen with a short debounce so
+    // the audio hardware settles and iOS restart throttling is respected —
+    // an immediate start() inside onend causes the rapid open/close storm.
     if (!listening || !running || micMuted || recogFatal) {
-      return; // intentionally stopped
+      return; // intentionally stopped — stay closed
     }
-    
-    // Debounced restart with longer delay to prevent rapid cycling on mobile
     clearTimeout(recogRestartTimer);
+    const now = performance.now();
+    const sinceEnd = now - lastRecogEndAt;
+    lastRecogEndAt = now;
+    // Storm guard: ends arriving <2s apart repeatedly mean the platform is
+    // throttling us — back off instead of hammering start().
+    if (sinceEnd < 2000) recogRapidEnds++;
+    else recogRapidEnds = 0;
+    let delay = (typeof isMobile !== 'undefined' && isMobile) ? 700 : 350;
+    if (consecutiveAborts >= 3) delay = Math.max(delay, 1500);
+    if (recogRapidEnds >= 4) delay = Math.min(2500, delay * 2);
+    // Abort storm (mic owned elsewhere / hardware fault): keep a slow
+    // heartbeat so a transient fault can still recover, but tell the user —
+    // a tight restart loop otherwise looks like a working mic.
+    if (consecutiveAborts >= 5) {
+      delay = 5000;
+      hearNote('Mic keeps failing — close other apps using the mic, then tap stop/start.', 5000);
+    }
     recogRestartTimer = setTimeout(() => {
-      if (listening && running && !micMuted && !recogFatal) {
-        try {
-          r.start();
-          log('[STT] recognition restarted after natural end');
-        } catch (err) {
-          if (err.name !== 'InvalidStateError') {
-            log('[STT] restart failed:', err.message);
-          }
+      recogRestartTimer = null;
+      if (!listening || !running || micMuted || recogFatal) return;
+      try {
+        r.start();
+      } catch (err) {
+        if (err && err.name !== 'InvalidStateError') {
+          log('[STT] restart failed:', (err && err.message) || (err && err.name));
         }
+        // InvalidStateError = already running — the mic is open, nothing to do.
       }
-    }, 500); // 500ms debounce to prevent rapid restart loops on mobile
+    }, delay);
   };
   return r;
 }
@@ -1903,25 +2007,432 @@ function micTestErrorMessage(error) {
 function resumeSTT() {
   if (!recog || recogFatal || micMuted) return;
   listening = true;
+  // Only start if recognition is not already running
   try {
     recog.start();
-    log('[STT] mic stream opened');
+    log('[STT] recognition started (mic stays open)');
   } catch (e) {
-    if (e.name !== 'InvalidStateError') {
+    if (e.name === 'InvalidStateError') {
+      // Already running - just set listening=true (no need to restart)
+      log('[STT] recognition already active (listening enabled)');
+    } else {
       log('[STT] start failed:', e.name);
     }
   }
 }
 
 function pauseSTT() {
+  // Only set listening=false, do NOT stop recognition
+  // This keeps the mic stream open but ignores speech events
   listening = false;
-  if (!recog) return;
+  log('[STT] listening paused (mic stays open)');
+}
+
+// True while the assistant owns the turn (LLM generating or TTS audio
+// queued/playing). STT stays listening through it so barge-in keeps working;
+// this helper exists so callers can reason about turn state explicitly.
+function isTurnActive() {
   try {
-    recog.stop();
-    log('[STT] mic stream closed');
+    return !!llmPending || !!(typeof audioQ !== 'undefined' && audioQ && audioQ.busy);
   } catch (e) {
-    log('[STT] stop failed:', e.name);
+    return !!llmPending;
   }
+}
+
+// True while the assistant owns the turn (LLM generating or TTS audio
+// queued/playing). STT stays listening through it so barge-in keeps working;
+// this helper exists so callers can reason about turn state explicitly.
+function isTurnActive() {
+  try {
+    return !!llmPending || !!(typeof audioQ !== 'undefined' && audioQ && audioQ.busy);
+  } catch (e) {
+    return !!llmPending;
+  }
+}
+
+// --- Mobile always-open capture: ONE held mic stream, no SpeechRecognition -
+// Web Speech owns its own mic stream and the platform auto-ends it on mobile
+// (silence/utterance/audio-focus), so "always open" is impossible through it.
+// This path holds a single getUserMedia stream for the whole session (opened
+// on start, closed only on stop), runs VAD levels on it for speech start/end
+// + barge-in, and records each utterance with its own fresh MediaRecorder —
+// one recorder per utterance, because a recorder emits container headers only
+// in its first slice (later slices of a shared recording are unparseable).
+// Each utterance is POSTed to /api/stt. Recorders come and go; the mic stream
+// indicator stays solid for the entire session. Falls back to Web Speech when
+// the server has no transcription key (serverConfig.server_stt false) or
+// MediaRecorder is unavailable.
+let mobStream = null, mobMime = '';
+let mobUtt = null;              // active per-utterance {rec, chunks, confirmed, dead, gen}
+let mobUttGen = 0;          // bumped on stop/mute/test: stale results dropped
+let mobTestPaused = false;  // mic-test hold: assembly paused, stream untouched
+let mobCaptureOn = false;
+
+function mobPickMime() {
+  if (typeof MediaRecorder === 'undefined') return '';
+  const cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+  try {
+    for (const c of cands) if (MediaRecorder.isTypeSupported(c)) return c;
+  } catch (e) {}
+  return '';
+}
+function mobFileExt() { return (mobMime || '').indexOf('mp4') >= 0 ? 'm4a' : 'webm'; }
+function mobLangCode() {
+  // Preferred-language id for the transcription prompt sample. Detection
+  // itself is always automatic — this only steers short utterances.
+  try {
+    const v = ($('language') && $('language').value) || localStorage.getItem('lang') || 'english';
+    if (v && v !== 'hinglish') return v;
+  } catch (e) {}
+  return '';
+}
+function mobCanUse() {
+  try {
+    return !!(!micMuted && typeof MediaRecorder !== 'undefined' && mobPickMime() &&
+      navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
+      serverConfig && serverConfig.server_stt);
+  } catch (e) {
+    return false;
+  }
+}
+function mobStreamLive() {
+  try {
+    return !!(mobStream && mobStream.getAudioTracks().some(t => t.readyState === 'live'));
+  } catch (e) {
+    return false;
+  }
+}
+function mobCleanupStream() {
+  mobAbortUtt();
+  mobCaptureOn = false;
+  try { mobStream && mobStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  mobStream = null;
+}
+// One fresh MediaRecorder per utterance. A recorder emits its container
+// headers only in its FIRST slice, so slicing utterances out of a single
+// continuous recording yields headerless fragments after the first turn —
+// the transcriber rejects those ("could not process file"). A recorder per
+// utterance is always a self-contained valid file, and starting/stopping it
+// never touches the held mic stream.
+function mobStartUtt() {
+  if (!mobStreamLive()) return null;
+  const u = { rec: null, chunks: [], confirmed: false, dead: false, gen: mobUttGen, peak: 0,
+    barged: (typeof aiSpeaking !== 'undefined' && !!aiSpeaking) };
+  let rec = null;
+  try {
+    // 32kbps is plenty for speech and keeps uploads small on mobile networks.
+    rec = new MediaRecorder(mobStream, { mimeType: mobMime, audioBitsPerSecond: 32000 });
+  } catch (e) {
+    try {
+      rec = new MediaRecorder(mobStream, { mimeType: mobMime });
+    } catch (e2) {
+      return null;
+    }
+  }
+  u.rec = rec;
+  // Reaper: a recorder that never confirms (cough with no speech after it)
+  // would otherwise run forever, hoarding silence. 4s is generous — real
+  // onsets confirm in ~250ms; confirmation clears this timer.
+  try {
+    u.blipTimer = setTimeout(() => {
+      if (mobUtt === u && !u.confirmed) {
+        mobAbortUtt();
+        log('[STT] unconfirmed blip discarded');
+      }
+    }, 4000);
+  } catch (e) {}
+  rec.ondataavailable = (ev) => {
+    try {
+      if (!u.dead && ev.data && ev.data.size) {
+        u.chunks.push(ev.data);
+        // Peak mic level during THIS utterance: proof real speech happened.
+        // A VAD-confirmed utterance with no energy above the floor is noise
+        // the gate briefly let through — hallucination fodder, drop it early.
+        try { if (vad && vad.level > u.peak) u.peak = vad.level; } catch (e2) {}
+      }
+    } catch (e) {}
+  };
+  rec.onstop = () => { mobFinishUtt(u); };
+  rec.onerror = () => {
+    // Faulted mid-utterance: drop it. The held stream is unaffected and the
+    // next speech starts a new recorder.
+    u.dead = true;
+    if (mobUtt === u) mobUtt = null;
+  };
+  try {
+    rec.start(250);
+  } catch (e) {
+    return null;
+  }
+  return u;
+}
+function mobAbortUtt() {
+  const u = mobUtt;
+  mobUtt = null;
+  if (!u) return;
+  u.dead = true;
+  u.chunks = [];
+  try { clearTimeout(u.blipTimer); } catch (e) {}
+  try { if (u.rec && u.rec.state !== 'inactive') u.rec.stop(); } catch (e) {}
+}
+function mobFinishUtt(u) {
+  if (!u || u.dead || u.gen !== mobUttGen) return; // discarded / stale session
+  if (!u.confirmed || !u.chunks.length) {
+    log('[STT] utterance discarded (unconfirmed blip or no audio)');
+    return;
+  }  if ((u.peak || 0) < 0.006) {
+    // Confirmed by the gate but the mic captured no real energy: fan knock,
+    // handling noise, or residual echo. Uploading it only buys a hallucinated
+    // transcript ("random words"), so drop it here.
+    log('[STT] utterance has no speech energy (peak ' + (u.peak || 0).toFixed(4) + ') — dropped');
+    return;
+  }
+  mobTranscribe(u.chunks, u.peak || 0, !!u.barged);
+}
+function mobOnFirstVoice() {
+  // First frame above the noise floor — start the recorder BEFORE the 250ms
+  // confirmation gate so the onset is never clipped. Never restart a running
+  // unconfirmed recorder here: a micro-dip inside the onset ("h-ello") would
+  // otherwise discard the opening syllables over and over, forcing the user
+  // to say hello twice. Gaps inside the utterance are harmless for Whisper.
+  if (micMuted || mobTestPaused || !mobCaptureOn || !running) return;
+  if (!mobUtt) {
+    mobUtt = mobStartUtt();
+    if (mobUtt) log('[STT] voice onset — capturing');
+    else log('[STT] recorder failed to start — utterance lost');
+  }
+}
+function mobOnSpeechStart() {
+  // VAD-confirmed speech (250ms above the floor): barge-in + mark live.
+  sustainedBargeIn();
+  if (micMuted || mobTestPaused || !mobCaptureOn || !running) return;
+  if (!mobUtt) {
+    mobUtt = mobStartUtt(); // fallback — first-voice normally beats us here
+    if (!mobUtt) {
+      log('[STT] recorder failed to start — utterance lost');
+      return;
+    }
+  }
+  mobUtt.confirmed = true;
+  try { clearTimeout(mobUtt.blipTimer); } catch (e) {}
+}
+function mobOnSpeechEnd() {
+  clearTimeout(speechTimer);
+  const u = mobUtt;
+  mobUtt = null;
+  if (!u) return;
+  try { clearTimeout(u.blipTimer); } catch (e) {}
+  if (micMuted || mobTestPaused || !mobCaptureOn || !running || !u.confirmed) {
+    u.dead = true;
+    u.chunks = [];
+    try { if (u.rec && u.rec.state !== 'inactive') u.rec.stop(); } catch (e) {}
+    return;
+  }
+  try {
+    if (u.rec.state !== 'inactive') u.rec.stop(); // onstop → mobFinishUtt
+    else mobFinishUtt(u);
+  } catch (e) {
+    u.dead = true;
+    u.chunks = [];
+  }
+}
+async function mobTranscribe(chunks, peak, barged) {
+  const gen = mobUttGen;
+  let blob = null;
+  try {
+    blob = new Blob(chunks, { type: mobMime || 'audio/webm' });
+  } catch (e) {
+    return;
+  }
+  if (!blob || blob.size < 1500) {
+    // Short-word floor ("haan"/"yes" at 32kbps ≈ 1.5-2KB): smaller than this
+    // is mic bump or cutoff, not speech. Logged so misses stay diagnosable.
+    log('[STT] utterance too short — dropped (' + (blob ? blob.size : 0) + 'B)');
+    return;
+  }
+  if (blob.size > 8 * 1024 * 1024) {
+    log('[STT] utterance too large — dropped');
+    return;
+  }
+  // No center text while waiting: the reply appears when ready. A typing
+  // indicator in the history drawer marks the in-flight request.
+  try { showTypingIndicator(); } catch (e) {}
+  const t0 = performance.now();
+  try {
+    const lang = mobLangCode();
+    const headers = {
+      'Content-Type': mobMime || 'audio/webm',
+      'X-Filename': 'utterance.' + mobFileExt(),
+      'X-Session': (typeof sid !== 'undefined' ? sid : ''),
+      'X-Level': String(peak || 0),
+      'X-Barged': barged ? '1' : '0',
+    };
+    if (lang) headers['X-Language'] = lang;
+    const r = await fetch('/api/stt', { method: 'POST', headers, body: blob });
+    const body = await r.json().catch(() => ({}));
+    if (gen !== mobUttGen) return; // stopped/muted/tested mid-flight — stale
+    if (!r.ok) {
+      const msg = (body && body.error) || ('HTTP ' + r.status);
+      log('[STT] transcription failed:', msg);
+      try { hideTypingIndicator(); } catch (e) {}
+      hearNote(r.status === 503 ? 'Server transcription is off — type below instead.' : msg, 4000);
+      return;
+    }
+    const text = ((body && body.text) || '').trim();
+    const replyLang = (body && body.language) || '';
+    log('[STT] server transcript (' + Math.round(performance.now() - t0) + 'ms): ' + JSON.stringify(text.slice(0, 100)) + (replyLang ? ' lang=' + replyLang : ''));
+    if (!text) {
+      try { hideTypingIndicator(); } catch (e) {}
+      return;
+    }
+    sendText(text, replyLang); // clears hearNote + guards duplicates; reply follows the spoken language
+  } catch (e) {
+    if (gen !== mobUttGen) return;
+    log('[STT] transcription error:', (e && e.name) || e);
+    try { hideTypingIndicator(); } catch (e2) {}
+    hearNote('Transcription failed — check connection.', 4000);
+  }
+}
+async function startMobileCapture() {
+  mobAbortUtt();
+  mobUttGen++;
+  mobTestPaused = false;
+  mobMime = mobPickMime();
+  if (!mobMime) {
+    log('[STT] always-open unavailable: no supported recorder mime type');
+    return false;
+  }
+  let stream = null;
+  try {
+    // Voice-optimized capture: echo cancellation (speaker feedback), noise
+    // suppression + auto gain (quiet mics / street noise) help the
+    // transcriber hear exact words.
+    const dev = selectedMicDevice();
+    const enhanced = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (dev) enhanced.deviceId = { ideal: dev };
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: enhanced });
+    } catch (e) {
+      // Older browsers may reject processing constraints: retry plain.
+      log('[STT] enhanced constraints rejected (' + ((e && e.name) || e) + ') — retrying basic capture');
+      stream = await navigator.mediaDevices.getUserMedia({ audio: dev ? { deviceId: { ideal: dev } } : true });
+    }
+  } catch (e) {
+    log('[STT] held mic stream denied:', (e && e.name) || e);
+    return false;
+  }
+  mobStream = stream;
+  mobCaptureOn = true;
+  vad = new EnergyVAD({ onSpeechStart: mobOnSpeechStart, onSpeechEnd: mobOnSpeechEnd, onFirstVoice: mobOnFirstVoice });
+  let wired = false;
+  try {
+    wired = await vad.attach(stream);
+  } catch (e) {
+    wired = false;
+  }
+  // End-of-turn on mobile (800ms, near desktop's 850): splitting a sentence
+  // at a mid-thought pause makes the transcriber confabulate an ending for
+  // each fragment ("...में कोई हैं?") — verified live on Hindi halves. Whole
+  // sentences stay exact; the extra ~250ms is minor next to the round trip.
+  // Slightly hotter VAD than desktop (quiet phone mics miss soft onsets
+  // otherwise); the adaptive floor still absorbs steady fan/AC hum.
+  try {
+    if (vad) {
+      vad.endOfTurnMs = 800;
+      vad.threshold = 0.006;
+      vad.snrGate = 1.8;
+    }
+  } catch (e) {}
+  if (!wired) {
+    log('[STT] always-open unavailable: VAD attach failed (' + (vad && vad.lastError) + ')');
+    try { vad && vad.stop(); } catch (e) {}
+    vad = null;
+    mobCleanupStream();
+    return false;
+  }
+  log('[STT] always-open capture ON — mic stream held for the session');
+  mobStartHealth();
+  return true;
+}
+// Watchdog: the OS can kill mic tracks mid-session (phone calls,
+// notifications, browser throttling) — then every utterance is silently lost
+// because dead tracks deliver no audio. Poll every 4s and reacquire.
+let mobHealthTimer = null, mobHealthNoted = false, mobRecovering = false;
+function mobStartHealth() {
+  mobStopHealth();
+  mobHealthNoted = false;
+  try {
+    mobHealthTimer = setInterval(() => {
+      try {
+        if (!mobCaptureOn || !running || mobRecovering) return;
+        if (mobStreamLive()) {
+          mobHealthNoted = false;
+          return;
+        }
+        mobRecoverStream();
+      } catch (e) {}
+    }, 4000);
+  } catch (e) {}
+}
+function mobStopHealth() {
+  try { clearInterval(mobHealthTimer); } catch (e) {}
+  mobHealthTimer = null;
+}
+async function mobRecoverStream() {
+  if (mobRecovering || !mobCaptureOn || !running) return;
+  mobRecovering = true;
+  try {
+    log('[STT] mic stream died — reacquiring');
+    mobAbortUtt();
+    try { mobStream && mobStream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} }); } catch (e) {}
+    mobStream = null;
+    const dev = selectedMicDevice();
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: Object.assign(
+          { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          dev ? { deviceId: { ideal: dev } } : {}
+        ),
+      });
+    } catch (e) {
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (e2) { stream = null; }
+    }
+    if (!stream || !mobCaptureOn || !running) throw new Error('reacquire-failed');
+    mobStream = stream;
+    if (vad) {
+      const ok = await vad.attach(stream);
+      try { vad.noiseFloor = null; } catch (e) {} // recalibrate to the new track
+      if (!ok) throw new Error('vad-attach-failed');
+    }
+    mobHealthNoted = false;
+    log('[STT] mic stream reacquired');
+  } catch (e) {
+    if (!mobHealthNoted) {
+      mobHealthNoted = true;
+      hearNote('Microphone stopped — tap stop, then start again.', 5000);
+      log('[STT] mic reacquire failed');
+    }
+  } finally {
+    mobRecovering = false;
+  }
+}
+function stopMobileCapture() {
+  if (!mobStream && !mobUtt && !mobCaptureOn) return; // never started — desktop / fallback path
+  mobStopHealth();
+  mobUttGen++; // drop any in-flight transcription
+  mobAbortUtt();
+  mobTestPaused = false;
+  mobCaptureOn = false;
+  try { vad && vad.stop(); } catch (e) {} // also closes the shared stream tracks
+  vad = null;
+  try { mobStream && mobStream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} }); } catch (e) {}
+  mobStream = null;
+  hearNote('');
 }
 
 function bargeIn() {
@@ -1990,14 +2501,27 @@ async function startSession() {
     } else {
       loadMicDevices();
     }
-  } else {
-    log('[VAD] mobile mode: native speech recognition handles audio stream');
+    recog = setupRecog();
+    if (recog) {
+      resumeSTT();
+    }
+    log('[APP] Flow build v' + APP_BUILD + ' • desktop VAD + browser speech recognition');
+  } else if (mobCanUse() && await startMobileCapture()) {
+    // Preferred mobile path: one held mic stream, never cycles.
+    log('[APP] Flow build v' + APP_BUILD + ' • mobile always-open capture');
     loadMicDevices();
-  }
-
-  recog = setupRecog();
-  if (recog) {
-    resumeSTT();
+  } else {
+    // Fallback: browser speech recognition (its platform-owned stream may
+    // still open/close between utterances — see the onend note in setupRecog).
+    if (mobCanUse()) log('[STT] always-open capture failed — falling back to browser speech recognition');
+    else log('[STT] fallback: server_stt=' + !!((serverConfig || {}).server_stt) +
+      ' mediarecorder=' + (typeof MediaRecorder !== 'undefined') + ' — using browser speech recognition');
+    log('[APP] Flow build v' + APP_BUILD + ' • browser speech recognition path');
+    loadMicDevices();
+    recog = setupRecog();
+    if (recog) {
+      resumeSTT();
+    }
   }
   log('[VAD] always-listening ON • auto-interrupt ON • STT ' + sttLang + ' • [TTS] Fish S2.1 Pro Free');
   if (!window.__micLiveTimer) {
@@ -2016,19 +2540,31 @@ function stopSession() {
   llmPending = false;
   aiSpeaking = false;
   recogFatal = true;
-  pauseSTT();
   lastInterim = ''; lastInterimAt = 0; awaitingFinal = false; lastSentText = '';
   userSaid('');
   try { LiveCaptions.stop(); } catch (e) {}
   setAiLine('');
   hideTypingIndicator();
   clearTimeout(speechTimer);
-  try { recog && recog.stop(); } catch (e) {}
+  clearTimeout(recogRestartTimer);
+  recogRestartTimer = null;
+  // Only here we truly stop recognition and close the mic stream
+  try { 
+    if (recog) {
+      recog.stop(); 
+      log('[STT] recognition stopped - mic stream closed');
+    }
+  } catch (e) {
+    log('[STT] stop error:', e.name);
+  }
   recog = null;
   if (vad) {
     try { vad.stop(); } catch (e) {}
     vad = null;
   }
+  // Always-open mobile path: stop the recorder and close the held stream.
+  // (No-ops on desktop / Web Speech fallback — recorder and stream are null.)
+  try { stopMobileCapture(); } catch (e) {}
   try { window.__micLevel = 0; } catch (e) {}
   $('micLive').classList.remove('on');
   if ($('topbar')) $('topbar').classList.add('hidden');
@@ -2062,6 +2598,10 @@ $('micMuteBtn').onclick = (e) => {
     lastInterimAt = 0;
     awaitingFinal = false;
     pauseSTT();
+    // Mobile capture: drop any stranded utterance + in-flight transcription.
+    // The held stream stays alive; the next speech starts a new recorder.
+    mobUttGen++;
+    mobAbortUtt();
     $('micLive').classList.remove('on');
     hearNote('Mic muted — I cannot hear you.');
   } else {
@@ -2069,7 +2609,10 @@ $('micMuteBtn').onclick = (e) => {
     lastInterimAt = 0;
     awaitingFinal = false;
     hearNote('');
-    if (running && !isTurnActive()) {
+    // Always resume on unmute while the session runs — even mid-turn, so
+    // barge-in keeps working while the AI is speaking (isTurnActive stays
+    // available for callers that need to reason about turn state).
+    if (running) {
       resumeSTT();
     }
   }
@@ -2107,17 +2650,16 @@ $('level').onchange = (e) => {
   try { localStorage.setItem('level', e.target.value); } catch (err) {}
   ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'set_level', value: e.target.value }));
 };
-const STT_LANGS = { english: 'en-IN', hindi: 'hi-IN', hinglish: 'en-IN' };
 function applyLanguage(v, silent) {
-  sttLang = STT_LANGS[v] || 'en-IN';
+  if (v === 'hinglish') v = 'english'; // retired: detection covers the mix
+  sttLang = sttCodeFor(v);
   try { localStorage.setItem('lang', v); } catch (e) {}
   if (ws && ws.readyState === 1 && !silent) ws.send(JSON.stringify({ type: 'set_language', value: v }));
   if (recog && listening) {
     // restart recognition so the new language takes effect
     try { recog.lang = sttLang; recog.stop(); } catch (e) {}
   }
-  log('[LANG] →', v, '(' + sttLang + ')');
-  if (v === 'hindi') log('[LANG] tip: pick the Hindi voice in settings for a native accent.');
+  log('[LANG] preferred →', v, '(' + sttLang + ') — replies follow the spoken language');
 }
 $('language').onchange = (e) => applyLanguage(e.target.value);
 $('anim').onchange = (e) => {
@@ -2131,6 +2673,37 @@ $('micDevice').onchange = (e) => {
 $('micTestBtn').onclick = async () => {
   // standalone 2.5s capture test: proves the mic path independent of STT
   const st = $('micTestStatus');
+  // Always-open path: sample the HELD stream's live level — opening a second
+  // getUserMedia here would fight the session for the mic hardware on mobile.
+  if (typeof isMobile !== 'undefined' && isMobile && mobCaptureOn && mobStreamLive() && vad) {
+    if (micMuted) {
+      st.textContent = 'Mic is muted — unmute, then test.';
+      return;
+    }
+    st.textContent = 'Listening for 2.5s — speak now…';
+    mobTestPaused = true;
+    mobUttGen++;
+    mobAbortUtt();
+    try {
+      let peak = 0;
+      const t0 = performance.now();
+      await new Promise((res) => {
+        const tick = () => {
+          try { peak = Math.max(peak, (vad && vad.level) || 0); } catch (e) {}
+          if (performance.now() - t0 < 2500) requestAnimationFrame(tick);
+          else res();
+        };
+        tick();
+      });
+      const pct = Math.round(Math.min(1, peak * 8) * 100);
+      const verdict = pct < 3 ? 'nothing heard — wrong mic or muted in system settings' : 'mic is capturing (peak ' + pct + '%)';
+      st.textContent = verdict;
+      log('[VAD] mic test peak:', pct + '% —', verdict);
+    } finally {
+      mobTestPaused = false;
+    }
+    return;
+  }
   st.textContent = 'Listening for 2.5s — speak now…';
   let stream = null, ctx = null;
   let resumeRecognition = () => {};

@@ -35,3 +35,21 @@ def test_practice_mode_enforces_selected_scenario():
     assert "Restaurant" in s_rest
     assert "restaurant waiter / server" in s_rest
     assert "Restaurant" in s_rest
+
+
+def test_reply_language_follows_any_language():
+    from app.conversation.prompts import LANGUAGES, language_addendum
+
+    assert "hinglish" not in LANGUAGES
+    assert language_addendum("english") == ""
+    es = language_addendum("spanish")
+    assert "Spanish" in es and "Converse in Spanish" in es
+    hi = language_addendum("hindi")
+    assert "Hindi" in hi
+    s_es = _system(language="spanish")
+    assert "Converse in Spanish" in s_es
+    s_en = _system(language="english")
+    assert "Converse in Spanish" not in s_en
+    # unknown languages fall back to english (no crash, no stray directive)
+    s_xx = _system(language="klingon")
+    assert "Converse in" not in s_xx

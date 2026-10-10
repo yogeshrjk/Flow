@@ -1,8 +1,9 @@
 /* Local energy VAD (free, no server). Distinguishes short pause vs end-of-turn. */
 class EnergyVAD {
-  constructor({ onSpeechStart, onSpeechEnd, onPartial } = {}) {
+  constructor({ onSpeechStart, onSpeechEnd, onPartial, onFirstVoice } = {}) {
     this.onSpeechStart = onSpeechStart || (() => {});
     this.onSpeechEnd = onSpeechEnd || (() => {});
+    this.onFirstVoice = onFirstVoice || (() => {});
     this.ctx = null; this.analyser = null; this.stream = null;
     this.speaking = false; this.lastSpeech = 0; this.level = 0;
     // natural end-of-turn (850ms pause window avoids mid-sentence splits), after SUSTAINED speech
@@ -13,6 +14,7 @@ class EnergyVAD {
     this.noiseFloor = null;  // tracked live: fans, AC, hum
     this.gate = 0.008;
     this._above = 0;
+    this._below = 0; // consecutive below-gate frames; _above resets after 3
     this.lastError = null;
     this._stopped = false;
     this.muted = false;
@@ -25,6 +27,7 @@ class EnergyVAD {
     }
     this.speaking = false;
     this._above = 0;
+    this._below = 0;
     this.lastSpeech = 0;
     if (this.muted) {
       this.level = 0;
@@ -44,6 +47,27 @@ class EnergyVAD {
       try { console.warn('[VAD] mic denied:', this.lastError); } catch (err) {}
       return false;
     }
+    return this._wire();
+  }
+  async attach(stream) {
+    // Wire analysis to an ALREADY-OPEN stream (always-open capture holds one
+    // getUserMedia stream for the session; opening a second one here would
+    // fight it for the mic hardware). stop() still closes the shared stream.
+    this.lastError = null;
+    this._stopped = false;
+    if (!stream) {
+      this.lastError = 'no-stream';
+      return false;
+    }
+    // Re-attach (mic recovery) must drop the previous context, or each
+    // recovery leaks an AudioContext still rendering the dead stream.
+    try { this.ctx && this.ctx.close(); } catch (e) {}
+    this.ctx = null;
+    this.analyser = null;
+    this.stream = stream;
+    return this._wire();
+  }
+  async _wire() {
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return false;
@@ -85,13 +109,24 @@ class EnergyVAD {
       // never animates the screen
       try { window.__micLevel = Math.max(0, rms - (this.noiseFloor || 0)); } catch (e) {}
       if (rms > this.gate) {
-        if (!this._above) this._above = now;
+        this._below = 0;
+        if (!this._above) {
+          this._above = now;
+          // first frame above the floor: lets recorders start before the
+          // 250ms confirmation gate, so the utterance onset is never clipped
+          try { this.onFirstVoice(); } catch (e) {}
+        }
         this.lastSpeech = now;
         if (!this.speaking && now - this._above >= this.minSpeechMs) {
           this.speaking = true; console.log('[VAD] speech-start'); this.onSpeechStart();
         }
       } else {
-        this._above = 0;
+        // Hangover: a single below-gate frame (plosive gaps like "h-ello",
+        // syllable dips) must not reset the onset — only sustained quiet does.
+        // Without this, every micro-dip refires onFirstVoice and the capture
+        // layer restarts the recorder, discarding the onset over and over.
+        this._below++;
+        if (this._below >= 3) this._above = 0;
         if (this.speaking && now - this.lastSpeech > this.endOfTurnMs) {
           this.speaking = false; console.log('[VAD] end-of-turn'); this.onSpeechEnd();
         }

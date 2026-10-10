@@ -207,6 +207,7 @@ class Session:
     level_setting: str = "auto"
     level: str = "B1"
     language: str = "english"
+    last_spoken_lang: str = ""  # detected per utterance; reply follows it, falls back to language
     voice_id: str = ""  # selected Fish voice; persona follows it
     scenario: str = "casual"
     challenge: dict = field(default_factory=dict)
@@ -311,14 +312,15 @@ class Engine:
         self.sessions[s.id] = s
         return s
 
-    def llm_messages(self, s: Session, scenario_text: str = "", challenge_text: str = "", extra_nudge: str = "") -> list[dict]:
+    def llm_messages(self, s: Session, scenario_text: str = "", challenge_text: str = "", extra_nudge: str = "",
+                       language: str = "") -> list[dict]:
         from app.voices import persona_for
         profile = load_profile(settings.data_dir, s.user_id)
         mem = memory_hint_for(profile, s)
         pname, pgender = persona_for(s.voice_id or None)
         sys = build_system(s.mode, s.level, s.level_setting, s.correction,
                            scenario=scenario_text or s.scenario, challenge=challenge_text,
-                           memory_hint=mem, language=s.language,
+                           memory_hint=mem, language=language or s.language,
                            persona_name=pname, persona_gender=pgender)
         # single system message: fold correction nudge in (two system msgs confuse some models)
         if extra_nudge:
@@ -368,7 +370,7 @@ class Engine:
 
     async def handle_gemini_live_turn(self, s: Session, text: str, send, t_turn0: float,
                                        t_speech_end_ms: float | None = None, turn_id: str = "",
-                                       req_id: str = ""):
+                                       req_id: str = "", reply_lang: str = ""):
         """Stream turn using Google's official Gemini Live BidiGenerateContent WebSocket."""
         req_id = req_id or turn_id or s.id
         log.info(f"[CHAT req_id={req_id}] chat handler entered (gemini_live) sid={s.id} text={text[:80]!r}")
@@ -484,7 +486,7 @@ class Engine:
                     pname, pgender = persona_for(s.voice_id or None)
                     sys_inst = build_system(s.mode, s.level, s.level_setting, s.correction,
                                             scenario=s.scenario, challenge="", memory_hint=mem,
-                                            language=s.language, persona_name=pname, persona_gender=pgender)
+                                            language=reply_lang or s.language, persona_name=pname, persona_gender=pgender)
                     live_sess = GeminiLiveSession(voice_name=voice_name)
                     log.info(f"[LLM req_id={req_id}] LLM request started (Gemini Live Bidi) voice={voice_name}")
                     await live_sess.connect(system_instruction=sys_inst)
@@ -591,16 +593,24 @@ class Engine:
 
     async def handle_user_turn(self, s: Session, text: str, send, t_turn0: float,
                                t_speech_end_ms: float | None = None, turn_id: str = "",
-                               req_id: str = ""):
-        """Stream LLM reply token-by-token via send() callback. Supports barge-in cancel."""
+                               req_id: str = "", reply_lang: str = ""):
+        """Stream LLM reply token-by-token via send() callback. Supports barge-in cancel.
+        reply_lang: detected spoken language for THIS turn — the reply follows
+        it, falling back to the session (preferred) language."""
         text = (text or "").strip()
         if not text:
             await send({"type": "status", "state": "LISTENING", "note": "empty transcript ignored", "req_id": req_id})
             return
+        from app.conversation.prompts import LANGUAGES
+        reply_lang = (reply_lang or "").lower()
+        turn_lang = reply_lang if reply_lang in LANGUAGES else (s.language or "english")
+        if turn_lang != (s.language or "english"):
+            log.info(f"[LANG] reply follows spoken language: {turn_lang} (preferred {s.language})")
 
         want_mode = (getattr(s, "response_mode", "") or settings.default_response_mode or "").lower()
         if want_mode in ("gemini_live", "live"):
-            return await self.handle_gemini_live_turn(s, text, send, t_turn0, t_speech_end_ms, turn_id, req_id=req_id)
+            return await self.handle_gemini_live_turn(s, text, send, t_turn0, t_speech_end_ms, turn_id, req_id=req_id,
+                                                      reply_lang=turn_lang)
 
         req_id = req_id or turn_id or s.id
         log.info(f"[CHAT req_id={req_id}] chat handler entered sid={s.id} mode={want_mode} text={text[:80]!r}")
@@ -628,7 +638,7 @@ class Engine:
 
         challenge_text = (s.challenge or {}).get("prompt", "") if s.mode == "challenge" else ""
         ci = corr.correction_instruction(to_correct)
-        messages = self.llm_messages(s, challenge_text=challenge_text, extra_nudge=ci)
+        messages = self.llm_messages(s, challenge_text=challenge_text, extra_nudge=ci, language=turn_lang)
 
         llm = self.llm_for(s)
         want_label = (s.response_mode or settings.default_response_mode or "fast")

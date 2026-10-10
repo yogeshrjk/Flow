@@ -28,7 +28,17 @@ conversation with optional light feedback when relevant.
   Fish answers **chunked** (measured: first frames 0.6-1.0s vs 2.2-2.9s for the
   whole mp3), so the first phrase of a turn is played **progressively** through
   `GET /api/tts/stream` (a `StreamingResponse` proxy of `FishProvider.open_stream`)
-- STT: browser Web Speech, lang `en-IN`. VAD: local energy (`vad.js`) with an
+- STT: browser Web Speech, lang `en-IN` — EXCEPT mobile with a transcription
+  key set (`server_stt` in `/api/config`): one held `getUserMedia` stream for
+  the whole session (opened on start, closed only on stop), VAD levels on it
+  via `EnergyVAD.attach()`, a fresh `MediaRecorder` per utterance (started on
+  the first above-floor frame via `onFirstVoice`, so onsets never clip),
+  each utterance POSTed raw to
+  `POST /api/stt` → Groq Whisper (`app/providers/stt/groq_whisper.py`,
+  `whisper-large-v3-turbo`, always auto-detect + one mixed-script prompt
+  sample + session context). No `python-multipart` needed:
+  the body is raw audio (`Content-Type: audio/*`, `X-Language`/`X-Filename`
+  headers). VAD: local energy (`vad.js`) with an
   adaptive noise floor (fan/AC hum raises the gate instead of triggering).
   A turn commits the moment speech ENDS (latest interim), not when the STT
   engine finalizes; the final is then deduped (`sameText`).
@@ -104,7 +114,10 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   `response_modes`: **Groq + Fish Audio** / **Gemini + Fish Audio** / **Gemini Live Preview**
   and their descriptions, unavailable tiers greyed with a note in `#respNote`;
   persisted in localStorage `respMode`, sent as WS `set_response_mode`), then mode/scenario/correction/level,
-  language (`#language`: english/hindi/hinglish), microphone (`#micDevice`
+  language (`#language`: preferred language, picker populated from
+  `/api/config` — 18 languages, no Hinglish; detection auto-IDs every turn and
+  the reply follows the SPOKEN language via `reply_lang`, falling back to this
+  preference), microphone (`#micDevice`
   picker from `enumerateDevices`, persisted, passed as `deviceId` to VAD
   `getUserMedia`; `#micTestBtn` standalone 2.5s capture test with peak readout
   in `#micTestStatus` (uses an ideal device constraint, pauses active speech
@@ -168,12 +181,22 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
    promise (`_playResolve`) or the queue wedges silent forever.
 4. One Fish request per sentence = network pause mid-thought:
    `SentenceCoalescer` holds <45-char sentences and merges (see tests).
-5. STT defaults to `en-IN`; mobile Web Speech recognition stays continuous so
-   ordinary utterance boundaries do not reopen the mic stream. Keep the `onend`
-   restart as recovery for browser-terminated sessions, but never restart while
-   muted or while an assistant turn is active (`isTurnActive()`: generation in
-   flight or TTS playback queue busy). STT is paused on turn submission and
-   resumes once after the entire response drains. Barge-in needs a sustained-speech
+5. STT defaults to `en-IN`; `continuous=true` is a HINT, not a guarantee —
+   mobile browsers auto-end recognition on silence/utterance boundaries (iOS
+   ignores `continuous` entirely; Android ends after seconds of silence;
+   audio-focus/power management can end it too) even though we never call
+   `stop()` mid-session. Each auto-end fires `onaudioend` ("mic stream closed")
+   + `onend`, and the restart fires `onaudiostart` ("mic stream opened") — so
+   the open/close pair in the log is the platform lifecycle, NOT a leak, and
+   "opens once, never cycles" is unachievable with Web Speech on mobile. The
+   `onend` restart is debounced (700ms mobile / 350ms desktop) with storm
+   backoff (ends <2s apart repeatedly, or ≥3 consecutive aborts, stretch the
+   delay up to 2.5s) and guarded by `listening && running && !micMuted &&
+   !recogFatal`. STT stays listening through assistant turns so barge-in keeps
+   working; `pauseSTT()` only flips the `listening` flag (never stops
+   hardware); only `stopSession()` truly stops recognition. Unmute always
+   resumes while running. `isTurnActive()` (`llmPending || audioQ.busy`) exists
+   for reasoning about turn state. Barge-in needs a sustained-speech
    gate (`vad.js` 300ms above an adaptive noise floor + 250ms extra hold) or
    coughs/fans false-trigger VAD. Low-confidence near-empty finals are dropped.
 6. Never store secrets in repo (`.env` is gitignored); never print keys to logs.
@@ -240,11 +263,38 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
    from the zero-result `self=true` owned-model query, but also set
    `window_limited=true` with an accessible total of 1,000. Never describe this
    endpoint as the complete public catalogue.
+17. Always-open mobile capture owns ONE mic stream: never open a second
+   `getUserMedia` while it runs (VAD uses `attach()`, the mic test samples the
+   held stream's live level, per-utterance recorders are only taps). Each
+   utterance gets a FRESH `MediaRecorder` — a recorder emits container headers
+   only in its first slice, so slicing turns out of one continuous recording
+   produced headerless fragments that Groq rejected after the first turn
+   ("could not process file"). The recorder starts on VAD's first above-floor
+   frame (`onFirstVoice`, before the 250ms confirmation gate) so onsets never
+   clip; unconfirmed blips are discarded. Stale transcriptions die via the
+   `mobUttGen` generation counter (bumped on stop/mute/test), same pattern as
+   the audio queue's `_gen`.
+18. Language is detected per utterance, never forced: forcing a language on
+   mismatched speech corrupts it (verified live: `en` on Hindi → "kıl",
+   Hindi prompt sample on English → Devanagari garbage, EN sample on
+   Spanish/French → "Mike Pademos"/prompt-parroting). `/api/stt` always
+   auto-detects (Whisper `language` field → our id via display-name lookup);
+   the prompt carries a sample in the PREFERRED language (load-bearing for
+   shorts: "haan" with no sample → "Huh?") plus the last-spoken language's
+   sample when switching, plus all recent context. The reply follows the
+   detected language (`reply_lang` on WS/HTTP turns → generic
+   `language_addendum()`), preferred is only the fallback. No language gets
+   hardcoded favoritism anywhere in this path.
 
 ## Tests
 - Mobile mic permission flow and top-corner controls: manually verify in a
   secure-origin mobile browser, including a denied permission and an active
   speech-recognition session.
+- `tests/test_stt.py` — Whisper multipart shape, no-key/empty/oversize/429
+  handling, `/api/stt` status codes (200/400/413/415/503), and that
+  `/api/config` gains only the `server_stt` availability flag.
+- `tests/test_prompts.py` — prompt guardrails plus the generic reply-language
+  rule (any language, unknown falls back to English, no Hinglish).
 - `tests/test_fish_library.py` — public visibility filtering, metadata mapping,
   English/Hindi pagination parameters, page and model-verification caches,
   empty results, and upstream rate-limit/network errors.
@@ -260,6 +310,21 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   mp3, playback start, barge-in cancel (manual, open `/static/latency.html`).
 
 ## Changelog (newest first — RULE ZERO: append here on every change)
+- 2026-10-10: Fix "say hello first" onset loss: any single below-gate frame (plosive gaps like "h-ello") reset the VAD onset and the capture layer ABORTED the running recorder, discarding the opening syllables over and over until the user sustained sound. VAD now needs 3 consecutive quiet frames to reset an onset, unconfirmed recorders are kept (gaps are harmless for Whisper) with a 4s blip-reaper so lone coughs can't hoard silence, and onset capture is logged; bumped `app.js?v=111` to `v=112`.
+- 2026-10-10: Diagnose "mic not working" properly: the reported log line (`recognition restarted after natural end`) exists only in the old committed build, proving a stale-cached `app.js` — so session start now logs `[APP] Flow build vN` + the chosen STT path (always-open vs fallback + why), every capture failure point logs its reason, and the Web Speech fallback escalates to a 5s heartbeat with an actionable note after 5 consecutive aborts instead of a silent storm; bumped `app.js?v=110` to `v=111` (hard refresh required).
+- 2026-10-10: True multilingual mode, Hinglish retired: 18 preferred languages (config-driven picker, `LANGUAGES` + BCP-47 codes in `prompts.py`), detection auto-IDs every utterance and the reply follows the SPOKEN language (`reply_lang` → generic `language_addendum()`, preferred is only the fallback) — live-verified end-to-end (Spanish utterance in an English session → Spanish AI reply). STT prompt carries a sample in the preferred language + last-spoken sample when switching + full context, no language hardcoded anywhere; Web Speech fallback uses best-of-3 alternatives in all languages; 66 tests passing; bumped `app.js?v=109` to `v=110`.
+- 2026-10-10: Hindi sentence integrity: 32kbps AAC transcribes Hindi identically to WAV (bitrate ruled out), but splitting a sentence at a mid-thought pause made Whisper confabulate endings ("...में कोई हैं?") and English session context distorted Hindi (dropped greetings, Latin intrusions) — both reproduced live. Mobile VAD gate is back to 800ms so whole sentences stay together, and prompt context is now script-matched to the hint (mismatched turns left out); hostile-context Hindi verified byte-identical to clean; 60 tests passing; bumped `app.js?v=107` to `v=108`.
+- 2026-10-10: Hindi that survives any Language setting: forcing `en` on Hindi speech mangled it ("kal" → "kıl") and a Hindi prompt sample hijacked English audio into Devanagari garbage — both reproduced live. The endpoint now always auto-detects; the prompt is one universal mixed-script sample (monolingual samples hijack, no sample collapses "haan" → "Huh?", mixed is safe both ways, all verified live) + session context. Full 6-way matrix exact (HI/MIX/EN × hindi/english/no hint, incl. shorts); server-only change, no cache bump; 59 tests passing.
+- 2026-10-10: Catch fluent hallucinations + speaker echo: word-rules can't see fluent invented sentences, so Whisper now returns `verbose_json` and segments averaging `no_speech_prob > 0.6` are dropped as noise-generated; utterances starting mid-AI-speech carry `X-Barged` and are dropped when they just repeat the last assistant reply (`_is_echo_of_assistant`, overlap ≥ 0.8, 4+ words); live-verified (silence dropped, English/Hindi exact); 57 tests passing; bumped `app.js?v=106` to `v=107`.
+- 2026-10-10: Stop hallucinated transcripts ("random words"): every utterance now carries its measured mic peak (`X-Level`); energy-less captures are dropped client-side before upload, and the server filters Whisper-on-noise signatures (looped words, caption-site junk like "thanks for watching", prompt-parroting, quiet+tiny) via `_looks_hallucinated()`, replying "I didn't catch that — say it once more?" instead of sending garbage as your turn; live-verified (silence rejected, real English/Hindi exact); bumped `app.js?v=105` to `v=106`.
+- 2026-10-10: Reliable mobile capture + lower latency: short utterances ("haan"/"yes") were silently dropped by the 4000B floor (at 32kbps they run ~1.5-2KB) — floor is now 1500B with every drop reason logged; recorder-start failures and discards log instead of vanishing; mobile VAD runs hotter (`threshold` 0.006, `snrGate` 1.8) and commits after 550ms; a 4s watchdog reacquires the mic when the OS kills tracks mid-session (calls/notifications) instead of losing every later utterance, and `vad.attach()` now closes the previous `AudioContext` so recovery never leaks; bumped `app.js?v=104` to `v=105`.
+- 2026-10-10: Better STT accuracy (English + Hindi): Whisper requests now carry a `prompt` (same-script sample steering Devanagari-vs-Latin choice + last 3 session turns biasing names/terms, via new `X-Session` header and `_stt_prompt()`), capture uses explicit voice constraints (`echoCancellation`/`noiseSuppression`/`autoGainControl` with plain-capture fallback); live-verified on real English, Hindi, and Hinglish speech — all transcribed exactly at 0.2-0.6s server-side; bumped `app.js?v=103` to `v=104`.
+- 2026-10-10: Fixed voice-picker cards on phones: the `≤640px` block re-declared a 2-column grid AFTER the `≤480px` single-column rule, so equal specificity + later order forced cramped 2-up cards on mobile. The mobile block now only tightens the gap; column counts come solely from the base rules (1 / 2 / 3 across phone / tablet / desktop); bumped `styles.css?v=77` to `v=78`.
+- 2026-10-10: Fixed "transcription failed" on mobile: the server hardcoded the multipart part type to `audio/webm`, so Safari `audio/mp4` recordings were rejected by Groq with a 400 (reproduced live: "file must be one of the following types"). `/api/stt` now forwards the real container type + filename, upstream error detail is distilled into a client-safe line (`_short_upstream_error`) instead of opaque "failed (400)", and the client shows the reason under the wave for 4s; verified end-to-end with real speech audio ("Hello, this is a microphone test." transcribed exactly); bumped `app.js?v=100` to `v=101`.
+- 2026-10-10: Faster mobile transcription, no center "Transcribing…" text: measured the server leg at 0.3-0.9s, so the felt delay was client-side — recorder now captures at 32kbps (`audioBitsPerSecond`, ~4x smaller uploads on mobile networks) and mobile VAD commits after a 650ms pause instead of 850ms; Whisper requests send `temperature=0`; while waiting, only a typing indicator in the history drawer shows (errors still surface under the wave); bumped `app.js?v=102` to `v=103`.
+- 2026-10-10: Fixed repeat-utterance transcription failures ("could not process file" after the first turn): a single continuous `MediaRecorder` emits container headers only in its first slice, so utterances sliced from it after turn one were headerless fragments. Each utterance now gets a FRESH `MediaRecorder` (always a self-contained valid file); it starts on VAD's first above-floor frame (`onFirstVoice` in `vad.js`) so onsets never clip, unconfirmed blips are discarded, and the held mic stream is untouched by recorder start/stop; bumped `app.js?v=101` to `v=102`.
+- 2026-10-10: Always-open mobile mic: Web Speech can never hold the mic (the platform auto-ends its stream), so mobile with a transcription key now holds ONE `getUserMedia` stream for the session (`EnergyVAD.attach()` for levels/barge-in + continuous `MediaRecorder` tap with pre-roll ring), POSTing each utterance raw to new `POST /api/stt` → Groq Whisper (`whisper-large-v3-turbo`, live-verified proxy path end-to-end); barge-in seeds without pre-roll (echo), stale results die via `mobUttGen`, mic test samples the held stream, Web Speech stays as fallback; `server_stt` availability flag in `/api/config` (no provider names); new `tests/test_stt.py` (10 tests, 47 passing); bumped `app.js?v=99` to `v=100`.
+- 2026-10-10: Fixed mobile mic open/close storm at its root: the immediate `r.start()` inside `onend` fought the platform's own auto-end (mobile browsers close SpeechRecognition on silence/utterance even with `continuous=true`, iOS ignores it entirely), so each cycle logged closed→opened in a tight loop. `onend` now restarts debounced (700ms mobile / 350ms desktop) with storm backoff (rapid ends or ≥3 aborts stretch the delay up to 2.5s); added the missing `isTurnActive()` definition (unmute referenced it → ReferenceError), unmute now always resumes while running so barge-in survives mid-turn unmute, and `stopSession()` clears the pending restart timer; bumped `app.js?v=98` to `v=99`.
 - 2026-10-10: Fixed mobile microphone stream open/close loop and stale playback timeouts: implemented turn-active state tracking (`llmPending` + `audioQ.busy` via `isTurnActive()`) so STT is paused upon turn submission and stays paused during LLM generation and across all streamed TTS playback phrases; STT restarts cleanly once when the entire audio queue drains; updated `AudioQueue` to track and clear active `_activePlayTimer` on playback cancellation and completion; bumped `audio.js?v=36` to `v=37` and `app.js?v=92` to `v=93`.
 - 2026-10-10: Kept mobile microphone capture active across recognized utterances by enabling continuous Web Speech recognition instead of ending and restarting after each phrase; retained guarded `onend` recovery for browser-terminated sessions and prevented recovery while muted; bumped `app.js?v=91` to `v=92`.
 - 2026-10-09: Built full Vercel Serverless support with HTTP/SSE streaming: added `POST /api/session/{sid}/turn` SSE streaming endpoint in `main.py` yielding live status, token, TTS, and completion events; created `vercel.json` routing configuration; configured `config.py` to use `/tmp/data` on Vercel read-only filesystems; updated `app.js` with seamless HTTP/SSE fallback transport (`streamHttpTurn()`) to eliminate WebSocket disconnect loops on serverless runtimes; added exponential backoff on STT aborts to prevent mic restart storms; 37 tests passing; bumped `app.js?v=90` to `v=91`.

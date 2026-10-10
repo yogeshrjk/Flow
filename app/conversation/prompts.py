@@ -86,14 +86,60 @@ CORRECTION_HINTS = {
 LANGUAGES = {
     "english": "English",
     "hindi": "Hindi",
-    "hinglish": "Hinglish",
+    "spanish": "Spanish",
+    "french": "French",
+    "german": "German",
+    "portuguese": "Portuguese",
+    "italian": "Italian",
+    "dutch": "Dutch",
+    "russian": "Russian",
+    "japanese": "Japanese",
+    "korean": "Korean",
+    "chinese": "Chinese (Mandarin)",
+    "arabic": "Arabic",
+    "tamil": "Tamil",
+    "telugu": "Telugu",
+    "bengali": "Bengali",
+    "marathi": "Marathi",
+    "urdu": "Urdu",
 }
 
-LANGUAGE_ADDENDA = {
-    "english": "",
-    "hindi": "Language: HINDI. Converse in Hindi (Devanagari script is fine). The user chose Hindi — meet them there warmly. If they ask about an English word or phrase, help briefly, then continue in Hindi. Do not force English corrections unless they ask.",
-    "hinglish": "Language: HINGLISH. Speak in natural Hinglish — Hindi-English mix in Latin script, the way Indian friends actually chat. Mirror the user's mix level. Help with English naturally when they reach for a word.",
+# BCP-47 codes for the browser speech-recognition fallback (the server
+# transcription path auto-detects instead and needs no per-language code).
+LANGUAGE_STT_CODES = {
+    "english": "en-IN",
+    "hindi": "hi-IN",
+    "spanish": "es-ES",
+    "french": "fr-FR",
+    "german": "de-DE",
+    "portuguese": "pt-PT",
+    "italian": "it-IT",
+    "dutch": "nl-NL",
+    "russian": "ru-RU",
+    "japanese": "ja-JP",
+    "korean": "ko-KR",
+    "chinese": "zh-CN",
+    "arabic": "ar-SA",
+    "tamil": "ta-IN",
+    "telugu": "te-IN",
+    "bengali": "bn-IN",
+    "marathi": "mr-IN",
+    "urdu": "ur-PK",
 }
+
+
+def language_addendum(lang: str) -> str:
+    """Reply-language rule, generic across every language: the preferred
+    language sets the default, but each turn answers in whatever language
+    the user just spoke (the caller passes the detected one)."""
+    if not lang or lang == "english":
+        return ""
+    name = LANGUAGES.get(lang, lang.replace("_", " ").title())
+    return (
+        f"Language: {name.upper()}. Converse in {name} — the user is speaking "
+        f"it now, so meet them there warmly. If they ask about a word or phrase "
+        f"in another language, help briefly, then continue in {name}."
+    )
 
 
 def build_system(mode: str, level: str, level_setting: str, correction: str, scenario: str = "", challenge: str = "",
@@ -130,6 +176,5 @@ def build_system(mode: str, level: str, level_setting: str, correction: str, sce
                                 persona_name=persona_name,
                                 persona_man_woman="woman" if persona_gender == "female" else "man",
                                 current_date=current_date) + "\n" + addendum
-    if LANGUAGE_ADDENDA.get(lang):
-        base += "\n" + LANGUAGE_ADDENDA[lang]
+    base += language_addendum(lang)
     return base
