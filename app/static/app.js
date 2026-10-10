@@ -1664,8 +1664,9 @@ function setupRecog() {
   const r = new SR();
   r.lang = sttLang;
   r.interimResults = true;
-  // Mobile browsers (Android Chrome) require single-utterance mode to prevent audio engine stream aborts
-  r.continuous = !isMobile;
+  // Keep mobile capture open across utterances; onend below remains a recovery path
+  // for browsers that terminate continuous recognition on their own.
+  r.continuous = true;
   r.maxAlternatives = 1;
   recogFatal = false;
   consecutiveAborts = 0;
@@ -1767,11 +1768,11 @@ function setupRecog() {
   };
   r.onaudioend = () => log('[STT] mic stream closed');
   r.onend = () => {
-    if (listening && running && !recogFatal) {
+    if (listening && running && !micMuted && !recogFatal) {
       clearTimeout(recogRestartTimer);
       const delay = consecutiveAborts > 2 ? 1500 : (isMobile ? 180 : 350);
       recogRestartTimer = setTimeout(() => {
-        if (listening && running && !recogFatal) {
+        if (listening && running && !micMuted && !recogFatal) {
           try {
             r.start();
           } catch (e) {

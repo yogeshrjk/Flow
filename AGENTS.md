@@ -168,7 +168,10 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
    promise (`_playResolve`) or the queue wedges silent forever.
 4. One Fish request per sentence = network pause mid-thought:
    `SentenceCoalescer` holds <45-char sentences and merges (see tests).
-5. STT lang must stay `en-IN`; barge-in needs a sustained-speech gate
+5. STT defaults to `en-IN`; mobile Web Speech recognition stays continuous so
+   ordinary utterance boundaries do not reopen the mic stream. Keep the `onend`
+   restart as recovery for browser-terminated sessions, but never restart while
+   muted. Barge-in needs a sustained-speech gate
    (`vad.js` 300ms above an adaptive noise floor + 250ms extra hold) or
    coughs/fans false-trigger VAD. Low-confidence near-empty finals are dropped.
 6. Never store secrets in repo (`.env` is gitignored); never print keys to logs.
@@ -255,6 +258,7 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   mp3, playback start, barge-in cancel (manual, open `/static/latency.html`).
 
 ## Changelog (newest first — RULE ZERO: append here on every change)
+- 2026-10-10: Kept mobile microphone capture active across recognized utterances by enabling continuous Web Speech recognition instead of ending and restarting after each phrase; retained guarded `onend` recovery for browser-terminated sessions and prevented recovery while muted; bumped `app.js?v=91` to `v=92`.
 - 2026-10-09: Built full Vercel Serverless support with HTTP/SSE streaming: added `POST /api/session/{sid}/turn` SSE streaming endpoint in `main.py` yielding live status, token, TTS, and completion events; created `vercel.json` routing configuration; configured `config.py` to use `/tmp/data` on Vercel read-only filesystems; updated `app.js` with seamless HTTP/SSE fallback transport (`streamHttpTurn()`) to eliminate WebSocket disconnect loops on serverless runtimes; added exponential backoff on STT aborts to prevent mic restart storms; 37 tests passing; bumped `app.js?v=90` to `v=91`.
 - 2026-10-09: Centered session timer at top-center on mobile screens: styled `#clock` with absolute horizontal and vertical centering (`left: 50%; top: 50%; transform: translate(-50%, -50%)`) within `#topbar` on mobile viewports ($\le 640\text{px}$); bumped `styles.css?v=76` to `v=77`.
 - 2026-10-09: Mobile layout refinements: moved conversation chat icon (`#historyBtn`) to the top-right corner next to settings icon (`#settingsBtn`, `right: 58px` and `right: 12px`); replaced the delete button in the conversation drawer header with a close (`x`) button (`#historyClose`); hid both chat and settings icons whenever either the conversation or settings panel is open on mobile screens; bumped `styles.css?v=75` to `v=76` and `app.js?v=89` to `v=90`.
