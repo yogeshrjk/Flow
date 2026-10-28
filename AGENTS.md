@@ -15,7 +15,9 @@ conversation with optional light feedback when relevant.
   in the UI — `/api/config` only exposes `response_modes` with labels/descriptions):
   - `"gemini_live"` → **"Gemini Live Preview"** = default response tier (`gemini-3.8-live`
     model via official Google Multimodal Live Bidi WebSocket, native bidirectional audio streaming,
-    paired with `gemini-3.5-transcribe-live` (Gemini 3.5 Transcribe Live) for millisecond-exact real-time streaming captions,
+    paired with `outputTranscription` and `LiveCaptions` audio-clock pacing for millisecond-exact
+    real-time streaming synchronized subtitles that transition sentence-by-sentence with speech
+    instead of waiting until speech completes,
     16 prebuilt celestial voices across Gemini Live App and Gemini API / Studio collections,
     standard default voice **Orbit**).
   - `"fast"` → **"Fast Response"** = Groq (`app/providers/llm/groq.py`, OpenAI-compat
@@ -47,10 +49,14 @@ conversation with optional light feedback when relevant.
   headers). VAD: local energy (`vad.js`) with an
   adaptive noise floor (fan/AC hum raises the gate instead of triggering),
   strict foreground threshold (`0.018`, SNR `2.2x`) preventing background chatter
-  and distant TV voices from triggering, plus a speech-shape gate (mid-frequency
-  spread admits human speech while rejecting narrow whistles and low snoring/rumble
-  before an utterance is confirmed). Utterances must meet peak >= 0.026 and SNR >= 2.2x
-  in `mobFinishUtt` before upload, and server-side `_looks_hallucinated` drops peak < 0.024.
+  and distant TV voices from triggering, sustained speech gate (`minSpeechMs = 280`)
+  rejecting sudden coughs/throat-clears/snorts, plus a multi-band speech-shape gate
+  (rejecting low snoring/rumble where `lowShare > 0.42` or `low > voice`, rejecting high-frequency
+  cough/click/sneeze bursts where `highShare > 0.28`, and requiring speech formant `voiceShare >= 0.36`).
+  Utterances must meet peak >= 0.026, SNR >= 2.2x, and `voiceConf >= 0.25` in `mobFinishUtt`
+  (with brief transient bursts < 0.28s dropped), while server-side `_looks_hallucinated`
+  drops non-speech tokens (`[cough]`, `*coughs*`, `snoring`, `throat clearing`, `ahem`, etc.)
+  silently without displaying error toasts.
   Without server transcription or MediaRecorder, browser Web Speech (`en-IN`)
   is the fallback; its platform-owned stream may cycle, so it cannot provide
   a never-close microphone guarantee.
@@ -211,7 +217,7 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   caches each page and verified public ID for five minutes. The UI exposes
   English, Hindi, Japanese, Chinese, Spanish, French, German, Portuguese,
   Korean, and Arabic filters.
-- Center text: `aiLine` gray (`#8f97a8`) with KEY WORDS white (`.ailine .hl`):
+- Center text: `aiLine` refined light typography (`font-weight: 300`, `#cbd5e1`) with KEY WORDS white-bold (`.ailine .hl`, `#ffffff`, `font-weight: 600` with cyan glow):
   the LLM wraps 1-3 key words per reply in `**double asterisks**` (prompt rule
   in prompts.py), client `emphasize()` renders them as `<span class="hl">`;
   when no markers arrive, a fallback heuristic highlights numbers, 'Quoted
@@ -219,8 +225,12 @@ the fixed canvas). Layer rule: content `.stage` z-index:1 above canvas z-index:0
   (`clean_for_speech` / `plainText`). Voice cues never appear in captions:
   `[empathetic]`/`[break]`/… are stripped for display (`strip_emotion_tags` →
   `display_text`, client `plainText()`), while a reply is being streamed the
-  engine buffer already excludes an unterminated trailing tag. GSAP fade+rise
-  on each completed reply (`animateAiLine`, never per-token).
+  engine buffer already excludes an unterminated trailing tag.
+  Sentence changes glide with a micro-softened transition; when speech ends,
+  `smokeDissolveAiLine` animates an ethereal upward dissipation into soft mist
+  (`y: -18`, `scale: 1.05`, `letter-spacing: 0.05em`, `blur: 12px`, `power2.out`)
+  with complete cleanup on completion (`clearProps: 'all'`) so incoming speech or
+  active reading text is always pristine, razor-sharp, and never bold.
 - `#userLine` caption under the wave: current user line only, fades 6s after
   last speech (interim + final + typed all route through `userSaid()`).
 - Animation: `orb.js` multi-style engine (GSAP-tweened rig + `gsap.ticker`):
@@ -497,6 +507,9 @@ Current user requirements: exactly Gemini Live Preview (default), Groq + Fish Au
   mp3, playback start, barge-in cancel (manual, open `/static/latency.html`).
 
 ## Changelog (newest first — RULE ZERO: append here on every change)
+- 2026-10-28: Restored atmospheric smoky dissolve effect and balanced typography: updated `.ailine` to light, refined font-weight (`300`, `#cbd5e1`, optical kerning `-0.012em`) so text is not all in bold, with bold preserved strictly on key highlighted words (`.hl`, `font-weight: 600`, `#ffffff`); restored ethereal `smokeDissolveAiLine` vapor dissipation (`y: -18`, `scale: 1.05`, `letter-spacing: 0.05em`, `filter: blur(12px)`) with clean teardown (`clearProps: 'all'`) on completion; ensured sentence transitions glide smoothly without lingering blur. Assets: styles 98, app 161.
+- 2026-10-28: Fixed blurry and low-visibility Gemini Live subtitles: removed all CSS `filter: blur(...)` and rasterizing `drop-shadow(...)` from `#aiLine`, `.ailine`, `smokeDissolveAiLine`, `dissolveAiLine`, and `LiveCaptions`; restored high-contrast foreground color `#e2e8f0` with dual crisp text-shadows, set `clearProps: 'filter'` and `clearProps: 'all'` in GSAP transitions, and bumped cache busters to `styles.css?v=97` and `app.js?v=160`.
+- 2026-10-28: Fixed Gemini Live subtitles appearing after speech complete by wiring up real-time `LiveCaptions` ticker synchronized to the Web Audio playback clock (`audioQ.liveProgress()`), proportionally pacing sentence reveals to audio duration, and fixing `maskAbbreviations` reference error; resolved `ConnectionClosedError` 1007 by adhering strictly to protobuf setup schema without unsupported setup fields (output audio transcription is emitted natively by Gemini Live); filtered out coughs, snoring, throat-clearing, sneezes, and impulse noises across VAD (`minSpeechMs = 280`, low-frequency snoring reject `lowShare > 0.42`, high-frequency cough reject `highShare > 0.28`), STT client filtering (`voiceConf >= 0.25`, transient noise drop `< 0.28s`), server-side `_looks_hallucinated` (`_NOISE_NON_SPEECH_TOKENS`, bracketed/asterisked noise tokens), and silent suppression in `isMissedOrHiccup`. Assets: vad 44, app 159.
 - 2026-10-28: Upgraded Settings panel Daily Plan & Progress button into a rich interactive preview card with live CEFR level pill, dynamic completed task/focus summary, and 3-stat strip (spoken minutes, tasks done, words observed); transformed Headphones interruption option from a raw HTML checkbox into a modern frosted toggle card with custom cyan sliding switch. Assets: app 158, learning 4, styles 96.
 - 2026-10-28: Modernized 'Your daily practice' modal popup and 'Listening practice' stage HUD card with glassmorphic styling, CEFR stats grid, interactive task cards, spaced review snippets, audio player deck with speed control, and instant graded choices; fixed Fish Audio voice picker full-screen border regression by scoping button CSS to `button.voice-picker-open` and using `body.voice-picker-modal-open`. Assets: app 157, learning 3, styles 95.
 - 2026-10-28: Corrected three-mode release verified: 225 Python tests, 8 Node audio tests, isolated DOM and offline smoke pass; compilation/syntax/diff checks pass. Live provider quality and audible latency remain unmeasured without real credentials.

@@ -54,8 +54,8 @@ button,.iconbtn,select,input,.radio,.textbtn{touch-action:manipulation;-webkit-t
 @keyframes blink{50%{opacity:.4}}
 .miclive{width:7px;height:7px;border-radius:50%;background:#232a36;transition:background .2s}
 .miclive.on{background:#34d399;box-shadow:0 0 8px #34d399}
-.ailine{margin-top:2px;font-size:clamp(24px,5.8vw,42px);font-weight:500;text-align:center;line-height:1.25;max-width:36rem;min-height:2.2rem;color:#8f97a8;filter:drop-shadow(0 2px 18px rgba(0,0,0,.9));will-change:opacity,transform,filter}
-.ailine .hl{color:#fff;font-weight:650}
+.ailine{margin-top:2px;font-size:clamp(24px,5.8vw,40px);font-weight:300;letter-spacing:-0.012em;text-align:center;line-height:1.28;max-width:38rem;min-height:2.2rem;color:#cbd5e1;text-shadow:0 2px 14px rgba(0,0,0,.85);will-change:opacity,transform,filter}
+.ailine .hl{color:#ffffff;font-weight:600;text-shadow:0 0 14px rgba(56,189,248,.45),0 2px 8px rgba(0,0,0,.9)}
 .hearnote{font-size:11px;color:#fbbf24;min-height:1rem}
 #wave{display:none}
 .transcriptwrap{margin-top:4px}

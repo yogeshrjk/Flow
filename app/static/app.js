@@ -283,7 +283,8 @@ function isMissedOrHiccup(t) {
   const s = t.trim();
   return /^(sorry[,\s]+)?(i\s+)?(missed that|didn't catch that|did not catch that|catch that|had a little hiccup|couldn't hear)/i.test(s) ||
          /(sorry,?\s+)?i\s+missed\s+that/i.test(s) ||
-         /(say that again|say it once more|repeat that|कृपया फिर से बोलें)/i.test(s);
+         /(say that again|say it once more|repeat that|कृपया फिर से बोलें)/i.test(s) ||
+         /(no speech detected|background noise|noise detected|empty audio|heard nothing intelligible)/i.test(s);
 }
 function hearNote(t, ms = 2600) {
   if (isMissedOrHiccup(t)) return;
@@ -854,6 +855,7 @@ function protectAbbr(t) {
     .replace(/([A-Za-z])\.([A-Za-z])/g, '$1' + ABBR_DOT + '$2')
     .replace(/(\d)\.(\d)/g, '$1' + ABBR_DOT + '$2');
 }
+function maskAbbreviations(t) { return protectAbbr(t); }
 function stripMetaReply(t) {
   return protectAbbr(t || '').replace(META_LEAD, '').trim();
 }
@@ -888,20 +890,25 @@ function smokeDissolveAiLine(delayMs = 1200) {
       aiSmokeTimeline = gsap.timeline({
         onComplete: () => {
           el.innerHTML = '';
-          gsap.set(el, { opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' });
+          el.style.filter = '';
+          el.style.letterSpacing = '';
+          gsap.set(el, { opacity: 1, y: 0, scale: 1, letterSpacing: 'normal', clearProps: 'all' });
           aiSmokeTimeline = null;
         }
       });
+      // Ethereal smoky vapor dissipation: text floats upward, softens into mist, and gently evaporates
       aiSmokeTimeline.to(el, {
         opacity: 0,
         y: -18,
         scale: 1.05,
-        filter: 'blur(16px)',
-        duration: 2.0,
+        letterSpacing: '0.05em',
+        filter: 'blur(12px)',
+        duration: 1.3,
         ease: 'power2.out'
       });
     } else {
       el.innerHTML = '';
+      el.style.filter = '';
     }
   }, delayMs);
 }
@@ -919,47 +926,91 @@ function dissolveAiLine(text) {
   const cleanSpoken = plainText(text);
   if (!cleanSpoken || !cleanSpoken.trim() || !/[\p{L}\p{N}]/u.test(cleanSpoken)) {
     if (window.gsap) {
-      gsap.to(el, { opacity: 0, y: -8, filter: 'blur(10px)', duration: 0.35, ease: 'power2.out', onComplete: () => { el.innerHTML = ''; } });
+      gsap.to(el, {
+        opacity: 0,
+        y: -12,
+        scale: 1.03,
+        filter: 'blur(8px)',
+        duration: 0.35,
+        ease: 'power2.out',
+        onComplete: () => {
+          el.innerHTML = '';
+          el.style.filter = '';
+          gsap.set(el, { opacity: 1, y: 0, scale: 1, clearProps: 'all' });
+        }
+      });
     } else {
       el.innerHTML = '';
+      el.style.filter = '';
     }
     return;
   }
   const newHtml = emphasize(text);
   if (!window.gsap) {
     el.innerHTML = newHtml;
+    el.style.filter = '';
     return;
   }
   if (aiDissolveTimeline) {
     aiDissolveTimeline.kill();
     aiDissolveTimeline = null;
   }
-  gsap.set(el, { scale: 1 });
+  el.style.filter = '';
   const currentContent = el.textContent.trim();
   const currentOpacity = parseFloat(getComputedStyle(el).opacity || '1');
   if (!currentContent || currentOpacity < 0.05) {
     el.innerHTML = newHtml;
     gsap.fromTo(el,
-      { opacity: 0, y: 12, filter: 'blur(8px)' },
-      { opacity: 1, y: 0, filter: 'blur(0px)', duration: 0.45, ease: 'power2.out', overwrite: true }
+      { opacity: 0, y: 8, filter: 'blur(4px)', scale: 0.99 },
+      {
+        opacity: 1,
+        y: 0,
+        filter: 'blur(0px)',
+        scale: 1,
+        duration: 0.35,
+        ease: 'power2.out',
+        overwrite: true,
+        onComplete: () => {
+          el.style.filter = '';
+          gsap.set(el, { clearProps: 'filter' });
+        }
+      }
     );
     return;
   }
-  aiDissolveTimeline = gsap.timeline();
+  aiDissolveTimeline = gsap.timeline({
+    onComplete: () => {
+      el.style.filter = '';
+      gsap.set(el, { clearProps: 'filter' });
+      aiDissolveTimeline = null;
+    }
+  });
   aiDissolveTimeline
     .to(el, {
       opacity: 0,
       y: -8,
       filter: 'blur(6px)',
-      duration: 0.2,
+      scale: 1.02,
+      duration: 0.18,
       ease: 'power2.in'
     })
     .call(() => {
       el.innerHTML = newHtml;
     })
     .fromTo(el,
-      { opacity: 0, y: 10, filter: 'blur(8px)' },
-      { opacity: 1, y: 0, filter: 'blur(0px)', duration: 0.4, ease: 'power2.out' }
+      { opacity: 0, y: 8, filter: 'blur(4px)', scale: 0.99 },
+      {
+        opacity: 1,
+        y: 0,
+        filter: 'blur(0px)',
+        scale: 1,
+        duration: 0.32,
+        ease: 'power2.out',
+        onComplete: () => {
+          el.style.filter = '';
+          gsap.set(el, { clearProps: 'filter' });
+        }
+      }
     );
 }
 
@@ -978,12 +1029,18 @@ function renderLiveCaption(txt) {
 
   const html = emphasize(activeSentence);
   if (html && el.innerHTML !== html) {
+    clearTimeout(aiSmokeFadeTimer);
+    if (aiSmokeTimeline) {
+      aiSmokeTimeline.kill();
+      aiSmokeTimeline = null;
+    }
     if (aiDissolveTimeline) {
       aiDissolveTimeline.kill();
       aiDissolveTimeline = null;
     }
     el.innerHTML = html;
-    try { if (window.gsap) gsap.set(el, { opacity: 1, y: 0, filter: 'blur(0px)' }); } catch (e) {}
+    el.style.filter = '';
+    try { if (window.gsap) gsap.set(el, { opacity: 1, y: 0, clearProps: 'filter' }); } catch (e) {}
   }
 }
 
@@ -1002,43 +1059,47 @@ function livePacedText(full) {
   if (!clean || META_OPEN.test(clean)) return '';
   let prog = null;
   try { prog = (typeof muted !== 'undefined' && muted) ? null : audioQ.liveProgress(); } catch (e) {}
-  // split protected text into sentences (abbreviation dots are masked)
-  const parts = [];
-  const offs = [];
-  const re = /[^.!?]+[.!?]+["']?|[^.!?]+$/g;
-  let m;
-  while ((m = re.exec(clean)) !== null) {
-    const s = m[0].trim();
+  const masked = protectAbbr(clean);
+  const parts = masked.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g) || [masked];
+  const sents = [];
+  const weights = [];
+  let totWeight = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const s = parts[i].trim();
     if (!s) continue;
-    parts.push(s);
-    offs.push(m.index);
+    sents.push(s);
+    // Weight length + natural inter-sentence boundary pause buffer
+    const w = Math.max(10, s.length) + 14;
+    weights.push(w);
+    totWeight += w;
   }
-  if (!parts.length) return '';
-  const played = prog ? prog.playedSec : 0;
+  if (!sents.length) return '';
+
+  const played = (prog && prog.playedSec) ? Math.max(0, prog.playedSec) : 0;
+  const recvSec = (prog && prog.recvSec) ? prog.recvSec : 0;
   let idx = 0;
-  if (!prog || prog.recvSec < 0.25) {
-    // audio not started yet: preview the first sentence
+
+  if (!prog || recvSec < 0.05 || played <= 0.02) {
+    // Audio has not yet started or is at the very first frames: preview the first sentence
     idx = 0;
   } else {
-    const pos = played * PACED_RATE + PACED_LEAD_CHARS;
-    for (let i = 0; i < parts.length; i++) {
-      if (offs[i] <= pos) idx = i;
-      else break;
+    const totalDur = Math.max(recvSec, played, 0.5);
+    let accumulated = 0;
+    for (let i = 0; i < sents.length; i++) {
+      const segDur = (weights[i] / totWeight) * totalDur;
+      if (played >= accumulated && (played < accumulated + segDur || i === sents.length - 1)) {
+        idx = i;
+        break;
+      }
+      accumulated += segDur;
     }
   }
-  idx = Math.max(idx, Math.min(pacedSentIdx, parts.length - 1));
+
+  // Ensure index advances with playback
+  idx = Math.max(idx, Math.min(pacedSentIdx, sents.length - 1));
   pacedSentIdx = idx;
-  let out = parts[idx];
-  if (!TERM_RE.test(out)) {
-    // if incomplete sentence, fall back to previous complete sentence if available;
-    // if no previous complete sentence, display the current opening fragment
-    let prev = '';
-    for (let i = idx - 1; i >= 0; i--) {
-      if (TERM_RE.test(parts[i])) { prev = parts[i]; break; }
-    }
-    if (prev) out = prev;
-    else out = out.length > 140 ? out.slice(0, 140).trim() + '…' : out;
-  }
+
+  const out = sents[idx];
   return out.split(ABBR_DOT).join('.');
 }
 // --- Gemini Live captions: SEPARATE logic from the Fish path, on purpose ---
@@ -1049,7 +1110,7 @@ function livePacedText(full) {
 // Instead this controller owns the center line for the whole turn on its own
 // ticker off the AUDIO clock (see audioQ.liveProgress()): text only
 // ever advances as far as the voice has actually spoken.
-const LIVE_MIN_DWELL_MS = 600;
+const LIVE_MIN_DWELL_MS = 250;
 const LiveCaptions = {
   timer: null,
   buf: '',
@@ -1059,16 +1120,27 @@ const LiveCaptions = {
   start() {
     // new turn: reset pacing + buffer, (re)start the audio-clock ticker
     try { if (this.timer) clearInterval(this.timer); } catch (e) {}
+    clearTimeout(aiSmokeFadeTimer);
+    if (aiSmokeTimeline) { aiSmokeTimeline.kill(); aiSmokeTimeline = null; }
+    if (aiDissolveTimeline) { aiDissolveTimeline.kill(); aiDissolveTimeline = null; }
+    const el = $('aiLine');
+    if (el) {
+      el.style.filter = '';
+      try { if (window.gsap) gsap.set(el, { opacity: 1, y: 0, clearProps: 'filter' }); } catch (e) {}
+    }
     this.buf = '';
     this.done = false;
     this.lastPaint = '';
     this.lastPaintAt = 0;
     pacedSentIdx = 0;
-    this.timer = setInterval(() => this.tick(), 150);
+    this.timer = setInterval(() => this.tick(), 60);
   },
   reset() {
     // new user turn before any reply audio: stop and forget everything
     try { if (this.timer) clearInterval(this.timer); } catch (e) {}
+    clearTimeout(aiSmokeFadeTimer);
+    if (aiSmokeTimeline) { aiSmokeTimeline.kill(); aiSmokeTimeline = null; }
+    if (aiDissolveTimeline) { aiDissolveTimeline.kill(); aiDissolveTimeline = null; }
     this.timer = null;
     this.buf = '';
     this.done = false;
@@ -1082,10 +1154,18 @@ const LiveCaptions = {
   },
   push(tok) {
     if (!this.timer) this.start();
-    this.buf += tok;
-    if (!this.lastPaint) this.tick();
+    this.buf += (tok || '');
+    this.tick();
+  },
+  update(text) {
+    if (!this.timer) this.start();
+    this.buf = text || '';
+    this.tick();
   },
   finish(text) {
+    clearTimeout(aiSmokeFadeTimer);
+    if (aiSmokeTimeline) { aiSmokeTimeline.kill(); aiSmokeTimeline = null; }
+    if (aiDissolveTimeline) { aiDissolveTimeline.kill(); aiDissolveTimeline = null; }
     this.buf = text || this.buf;
     this.done = true;
     this.tick();
@@ -1102,12 +1182,36 @@ const LiveCaptions = {
     const now = performance.now();
     if (html && html !== this.lastPaint &&
         (!this.lastPaint || now - this.lastPaintAt >= LIVE_MIN_DWELL_MS)) {
+      clearTimeout(aiSmokeFadeTimer);
+      if (aiSmokeTimeline) {
+        aiSmokeTimeline.kill();
+        aiSmokeTimeline = null;
+      }
       if (aiDissolveTimeline) {
         aiDissolveTimeline.kill();
         aiDissolveTimeline = null;
       }
+      el.style.filter = '';
       el.innerHTML = html;
-      try { if (window.gsap) gsap.set(el, { opacity: 1, y: 0, filter: 'blur(0px)' }); } catch (e) {}
+      try {
+        if (window.gsap) {
+          gsap.fromTo(el,
+            { opacity: 0.5, y: 4, filter: 'blur(3px)' },
+            {
+              opacity: 1,
+              y: 0,
+              filter: 'blur(0px)',
+              duration: 0.22,
+              ease: 'power2.out',
+              overwrite: true,
+              onComplete: () => {
+                el.style.filter = '';
+                gsap.set(el, { clearProps: 'filter' });
+              }
+            }
+          );
+        }
+      } catch (e) {}
       this.lastPaint = html;
       this.lastPaintAt = now;
     }
@@ -1115,8 +1219,9 @@ const LiveCaptions = {
       // turn text is final: stop once the voice has caught up with it
       let prog = null;
       try { prog = audioQ.liveProgress(); } catch (e) {}
-      if (!prog || prog.recvSec < 0.25 || prog.playedSec >= prog.recvSec - 0.1) {
+      if (!prog || !audioQ.busy || (prog.recvSec > 0.25 && prog.playedSec >= prog.recvSec - 0.05)) {
         this.stop();
+        smokeDissolveAiLine(1400);
       }
     }
   }
@@ -1881,7 +1986,11 @@ function handleServerMessage(m) {
     if (!currentTurnAiText.includes(cap)) {
       currentTurnAiText = cap;
     }
-    renderLiveCaption(cap);
+    if (audioQ.engine === 'gemini') {
+      LiveCaptions.update(cap);
+    } else {
+      renderLiveCaption(cap);
+    }
   }
   else if (m.type === 'llm_token') {
     if (state === 'INTERRUPTED' || audioQ.cancelled || (m.turn && audioQ.deadTurns.has(m.turn)) || (m.req_id && audioQ.deadTurns.has(m.req_id))) {
@@ -1892,7 +2001,7 @@ function handleServerMessage(m) {
     recordAiLine(m.token);
     recordAiLine(currentTurnAiText);
     if (audioQ.engine === 'gemini') {
-      try { renderLiveCaption(currentTurnAiText); } catch (e) {}
+      LiveCaptions.update(currentTurnAiText);
     }
   }
   else if (m.type === 'notice') {
@@ -1905,6 +2014,9 @@ function handleServerMessage(m) {
     llmPending = true;
     setState('SPEAKING');
     if (!$('aiTyping')) showTypingIndicator();
+    if (audioQ.engine === 'gemini') {
+      LiveCaptions.start();
+    }
   }
   else if (m.type === 'tts_sentence') {
     if (isMissedOrHiccup(m.text)) return;
@@ -1944,6 +2056,9 @@ function handleServerMessage(m) {
       return;
     }
     audioQ.playLivePcmChunk(m.data, 24000, m.turn);
+    if (audioQ.engine === 'gemini' && !LiveCaptions.timer) {
+      LiveCaptions.start(m.turn);
+    }
   }
   else if (m.type === 'response_mode') {
     labelFor(m.value);
@@ -1977,25 +2092,19 @@ function handleServerMessage(m) {
       currentTurnAiText = (currentTurnAiText + ' ' + displayText).trim();
     }
     recordAiLine(currentTurnAiText);
-    // Live center line mirrors the voice: latest chunk only (fish path keeps
-    // its own per-sentence display and is untouched by liveChunkText).
+    // Live center line mirrors the voice in real time: LiveCaptions synchronizes
+    // sentences to the PCM audio clock; Fish path keeps its per-sentence display.
     const centerText = m.live ? (liveChunkText(displayText) || displayText) : displayText;
     addTurn('Partner', displayText);
     if (m.mistakes && m.mistakes.length > 0 && m.fixed_text) {
       applyServerGrammarCorrection(m.mistakes, m.fixed_text);
     }
     log(`[UI req_id=${reqId}] assistant message rendered in chat`);
-    if (m.live) {
-      // Live ticker owns the center line until the voice drains: never dump
-      // the paragraph here. Hand it the final text and let it converge.
-      // No dissolve here either — audioQ.onDrained fades the line when the
-      // voice actually finishes (a timer now would fight the ticker).
-      if (!m.partial && state !== 'INTERRUPTED') {
-        try { renderLiveCaption(displayText); } catch (e) { setAiLine(centerText); }
-      }
+    if (m.live || audioQ.engine === 'gemini') {
+      LiveCaptions.finish(displayText);
     }
     if (m.correction && m.correction.length) log('[COACH]', JSON.stringify(m.correction));
-    if (!audioQ.busy) {
+    if (!audioQ.busy && audioQ.engine !== 'gemini') {
       aiSpeaking = false;
       if (!m.partial && state !== 'INTERRUPTED') {
         setAiLine(centerText);
@@ -2186,6 +2295,9 @@ async function connect() {
       }
       reading.pendingFeedback = null;
     }
+    if (audioQ.engine === 'gemini') {
+      try { LiveCaptions.stop(); } catch (e) {}
+    }
     if (!llmPending) {
       aiSpeaking = false;
       if (running && state !== 'INTERRUPTED') {
@@ -2193,7 +2305,7 @@ async function connect() {
       } else if (!running) {
         setState('IDLE');
       }
-      smokeDissolveAiLine(1400);
+      smokeDissolveAiLine(1200);
     }
   };
   audioQ.onSentenceStart = (text, turn) => {
@@ -4387,15 +4499,16 @@ function mobFinishUtt(u) {
     return;
   }
 
-  // 3. Spectral speech confidence:
-  if (u.voiceConf !== undefined && u.voiceConf < 0.20) {
+  // 3. Spectral speech confidence (rejects snoring, hum, whistles, coughs):
+  if (u.voiceConf !== undefined && u.voiceConf < 0.25) {
     log('[STT] non-speech spectral signature (conf ' + u.voiceConf.toFixed(2) + ') — dropped');
     return;
   }
-  // Always transcribe a VAD-confirmed voice, even if playback starts or
-  // stops during the utterance. The old timing-based drop lost real speech;
-  // transcript-level echo/noise checks are the safe place to reject it.
   const duration = Math.max(0, ((u.endedAt || performance.now()) - u.startedAt - 850) / 1000);
+  if (duration < 0.28 && (u.peak || 0) < 0.040) {
+    log('[STT] transient noise burst dropped (dur=' + duration.toFixed(2) + 's, peak=' + (u.peak || 0).toFixed(4) + ')');
+    return;
+  }
   mobTranscribe(u.chunks, u.peak || 0, !!u.barged, duration, u.wallEnd || Date.now());
 }
 function mobOnFirstVoice() {

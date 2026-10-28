@@ -10,7 +10,7 @@ class EnergyVAD {
     // natural end-of-turn (1000ms pause window avoids premature cutoffs between speech clauses while staying responsive)
     this.endOfTurnMs = 850;
     this.threshold = 0.018;  // reliable gate against ambient room noise, background voices, and quiet breathing
-    this.minSpeechMs = 240;  // confirms sustained voice (bridges plosives, rejects clicks/snorts)
+    this.minSpeechMs = 280;  // confirms sustained voice (bridges plosives, rejects coughs/clicks/snorts)
     this.snrGate = 2.2;      // speech must beat ambient noise by 2.2x
     this.noiseFloor = null;  // tracked live: fans, AC, hum, ambient sounds
     this.gate = 0.018;
@@ -236,11 +236,12 @@ class EnergyVAD {
   }
   _hasSpeechShape(freq) {
     // Speech normally spreads energy across roughly 220–3400 Hz. A whistle is
-    // a single sharp spectral peak, while snoring/handling rumble stays mostly
-    // below 200 Hz.
+    // a single sharp spectral peak. Snoring and low rumble stay predominantly
+    // below 200 Hz. Coughs, sneezes, clicks, and hisses have massive high-frequency (>3800 Hz)
+    // energy without sustained speech formants.
     try {
       const hzPerBin = (this.ctx && this.ctx.sampleRate ? this.ctx.sampleRate : 48000) / this.analyser.fftSize;
-      let total = 0, voice = 0, low = 0, peak = 0;
+      let total = 0, voice = 0, low = 0, high = 0, peak = 0;
       for (let i = 1; i < freq.length; i++) {
         const energy = freq[i] * freq[i];
         if (!energy) continue;
@@ -248,16 +249,33 @@ class EnergyVAD {
         total += energy;
         if (hz >= 220 && hz <= 3400) voice += energy;
         if (hz < 200) low += energy;
+        if (hz > 3800) high += energy;
         if (energy > peak) peak = energy;
       }
       if (total < 120) { this.voiceConfidence = 0; return false; }
       const voiceShare = voice / total;
       const lowShare = low / total;
+      const highShare = high / total;
       const peakShare = peak / total;
-      // Store a useful diagnostic/utterance confidence without exposing it in
-      // the UI. A single-bin tone gets near zero; voiced speech trends high.
-      this.voiceConfidence = Math.max(0, Math.min(1, voiceShare * (1 - peakShare)));
-      return voiceShare >= 0.32 && lowShare <= 0.60 && peakShare <= 0.38;
+
+      // Snoring/rumble has heavy low energy (lowShare > 0.42 or low > voice).
+      if (lowShare > 0.42 || low > voice * 1.05) {
+        this.voiceConfidence = 0.05;
+        return false;
+      }
+      // Coughs, sneezes, clicks, and noise bursts have highShare > 0.28.
+      // Pure whistles or feedback tones have peakShare > 0.35.
+      if (highShare > 0.28 || peakShare > 0.35) {
+        this.voiceConfidence = 0.08;
+        return false;
+      }
+      if (voiceShare < 0.36) {
+        this.voiceConfidence = Math.max(0, voiceShare * 0.5);
+        return false;
+      }
+      // Store a diagnostic/utterance confidence without exposing it in the UI.
+      this.voiceConfidence = Math.max(0, Math.min(1, voiceShare * (1 - peakShare) * (1 - lowShare * 1.4)));
+      return this.voiceConfidence >= 0.20;
     } catch (e) {
       // If a browser omits frequency data, retain the existing energy VAD
       // rather than making its microphone unusable.

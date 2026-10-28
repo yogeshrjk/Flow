@@ -238,6 +238,16 @@ def test_hallucination_filter():
     assert _looks_hallucinated("hey there", "", 0.026) is True
     assert _looks_hallucinated("hey there", "", 0.035) is False
     assert _looks_hallucinated("yes", "", None) is False  # no energy reading: not condemned
+    # cough, snoring, throat-clearing, and noise rejection
+    assert _looks_hallucinated("[cough]", "", 0.05) is True
+    assert _looks_hallucinated("*coughs*", "", 0.05) is True
+    assert _looks_hallucinated("Coughing.", "", 0.05) is True
+    assert _looks_hallucinated("snoring", "", 0.05) is True
+    assert _looks_hallucinated("[throat clearing]", "", 0.05) is True
+    assert _looks_hallucinated("ahem", "", 0.05) is True
+    assert _looks_hallucinated("*snort*", "", 0.05) is True
+    assert _looks_hallucinated("(heavy breathing)", "", 0.05) is True
+    assert _looks_hallucinated("I have a cough and cold", "", 0.05) is False
     # real replies pass through
     assert _looks_hallucinated("haan, chalo coffee peete hain", "something else entirely", 0.04) is False
     assert _looks_hallucinated("yes", "", 0.03) is False

@@ -452,7 +452,7 @@ async def stt_transcribe(request: Request):
 
 
 # Classic Whisper-on-noise signatures: looped words, caption-site junk,
-# prompt parroted back on silence, or hallucinations on background audio / whistle / snoring.
+# prompt parroted back on silence, or hallucinations on background audio / whistle / snoring / cough.
 _STT_JUNK_PHRASES = (
     "thanks for watching", "thank you for watching", "subscribe",
     "transcription by", "amara.org", "http://", "https://", "www.",
@@ -465,6 +465,17 @@ _QUIET_NOISE_PHRASES = (
     "thank you", "thanks", "thank you very much", "thank you so much",
     "you", "bye", "bye-bye", "goodbye", "the end", "see you next time",
 )
+
+# Non-speech acoustic noises: coughs, throat-clearing, snoring, sneezes, breathing, grunts
+_NOISE_NON_SPEECH_TOKENS = {
+    "cough", "coughs", "coughing", "throat clearing", "throat-clearing", "clears throat",
+    "clearing throat", "snore", "snores", "snoring", "sneeze", "sneezes", "sneezing",
+    "sigh", "sighs", "sighing", "yawn", "yawns", "yawning", "gasp", "gasps", "gasping",
+    "groan", "groans", "groaning", "pant", "pants", "panting", "snort", "snorts", "snorting",
+    "wheeze", "wheezes", "wheezing", "heavy breathing", "deep breath", "breathing",
+    "background noise", "static", "silence", "applause", "laughter", "chuckle", "giggle",
+    "ahem", "uhm", "mhm", "grunt", "grunts", "grunting", "burp", "belch",
+}
 
 
 def _word_overlap(a: str, b: str) -> float:
@@ -481,13 +492,22 @@ def _looks_hallucinated(text: str, context: str, peak: float | None) -> bool:
     if not cleaned:
         return True
     import re
-    no_brackets = re.sub(r"\[.*?\]|\(.*?\)", "", cleaned).strip()
+    # Strip brackets, parentheses, asterisks, tildes (e.g. [cough], (snore), *coughs*, ~sigh~)
+    no_brackets = re.sub(r"\[.*?\]|\(.*?\)|[*_~].*?[*_~]", "", cleaned).strip()
     if not no_brackets:
         return True
     words = no_brackets.split()
     if not words:
         return True
     low = no_brackets.lower().strip().rstrip(".!?,")
+    # Exact non-speech phrase match
+    if low in _NOISE_NON_SPEECH_TOKENS:
+        return True
+    # Strip punctuation from words and check if all words are non-speech noise tokens
+    norm_words = [re.sub(r"[^\w]", "", w.lower()) for w in words]
+    norm_words = [w for w in norm_words if w]
+    if norm_words and all(w in _NOISE_NON_SPEECH_TOKENS for w in norm_words):
+        return True
     if any(p in low for p in _STT_JUNK_PHRASES):
         return True
     if low in _QUIET_NOISE_PHRASES:

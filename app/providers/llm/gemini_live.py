@@ -219,8 +219,14 @@ class GeminiLiveSession:
                     break
 
                 # 1. Output audio transcription (real-time text tokens)
-                if "outputTranscription" in sc:
-                    t_token = sc["outputTranscription"].get("text", "")
+                ot = (
+                    sc.get("outputTranscription")
+                    or sc.get("output_transcription")
+                    or data.get("outputTranscription")
+                    or data.get("output_transcription")
+                )
+                if ot and isinstance(ot, dict):
+                    t_token = ot.get("text", "")
                     if t_token:
                         full_text_parts.append(t_token)
                         if on_text:
@@ -229,23 +235,23 @@ class GeminiLiveSession:
                                 await res
 
                 # 2. Live streaming PCM audio chunk (24000Hz 16-bit PCM)
-                model_turn = sc.get("modelTurn", {})
+                model_turn = sc.get("modelTurn") or sc.get("model_turn") or data.get("modelTurn") or data.get("model_turn") or {}
                 for p in model_turn.get("parts", []):
-                    if "inlineData" in p:
-                        pcm_b64 = p["inlineData"].get("data", "")
-                        mime = p["inlineData"].get("mimeType", "audio/pcm;rate=24000")
+                    inline = p.get("inlineData") or p.get("inline_data")
+                    if inline and isinstance(inline, dict):
+                        pcm_b64 = inline.get("data", "")
+                        mime = inline.get("mimeType") or inline.get("mime_type", "audio/pcm;rate=24000")
                         if pcm_b64 and on_audio:
                             res = on_audio(pcm_b64, mime)
                             if asyncio.iscoroutine(res):
                                 await res
-                    if "text" in p:
-                        t_token = p.get("text", "")
-                        if t_token:
-                            full_text_parts.append(t_token)
-                            if on_text:
-                                res = on_text(t_token)
-                                if asyncio.iscoroutine(res):
-                                    await res
+                    if "text" in p and p["text"]:
+                        t_token = p["text"]
+                        full_text_parts.append(t_token)
+                        if on_text:
+                            res = on_text(t_token)
+                            if asyncio.iscoroutine(res):
+                                await res
 
                 if sc.get("turnComplete"):
                     break
