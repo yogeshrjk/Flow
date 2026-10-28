@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Voice latency probe — Fish streaming vs full download</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#05070c; color:#dfe5ee; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin:0; padding:28px; }
+  h1 { font-size:15px; letter-spacing:.08em; text-transform:uppercase; color:#8b93a3; font-weight:600; }
+  p.hint { color:#5b6474; max-width:70ch; }
+  button { background:#10141f; border:1px solid #232c3f; border-radius:10px; padding:10px 14px; color:#dfe5ee; font:inherit; cursor:pointer; margin:0 8px 8px 0; }
+  button:hover { border-color:#33425e; }
+  button[disabled] { opacity:.5; cursor:default; }
+  table { border-collapse:collapse; margin-top:14px; width:100%; max-width:960px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid #161c28; }
+  th { color:#5b6474; font-weight:500; }
+  td.num { color:#38bdf8; }
+  td.good { color:#34d399; }
+  #out { margin-top:16px; color:#5b6b82; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Voice latency probe</h1>
+<p class="hint">
+  Measures the voice leg in THIS browser (the piece the server cannot see): how soon Fish's
+  first frames reach a media element versus waiting for the complete mp3, plus a barge-in
+  cancel check. Same origin as the app, so it uses the real endpoints and the voice you
+  picked in Settings. Click once to unlock audio, then run the tests.
+</p>
+<div>
+  <button id="unlock">1. Unlock audio</button>
+  <button id="run" disabled>2. Run TTS timing</button>
+  <button id="cancel" disabled>3. Test barge-in cancel</button>
+</div>
+<table id="tbl" hidden>
+  <thead><tr><th>phase</th><th>text</th><th>measured</th><th>note</th></tr></thead>
+  <tbody></tbody>
+</table>
+<div id="out">idle</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const tbody = $('tbl').querySelector('tbody');
+const voice = () => { try { return localStorage.getItem('fishVoice') || ''; } catch (e) { return ''; } };
+const ms = (v) => v == null ? 'n/a' : Math.round(v) + 'ms';
+
+function row(phase, text, value, note, good) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = '<td>' + phase + '</td><td>' + text.replace(/</g, '&lt;') + '</td>' +
+    '<td class="num' + (good ? ' good' : '') + '">' + value + '</td><td>' + (note || '') + '</td>';
+  tbody.appendChild(tr);
+}
+function say(s) { $('out').textContent = s; }
+
+const TEXTS = {
+  short: 'Right on.',
+  typical: 'Sounds like a busy day at the office.',
+};
+
+// --- streaming path: <audio src=/api/tts/stream> starts on the first frames ---
+function streamTiming(text) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const a = new Audio();
+    let dataAt = null, playAt = null, err = null;
+    const done = () => resolve({ dataAt, playAt, err, bytes: 0 });
+    a.preload = 'auto';
+    a.onprogress = a.onloadedmetadata = () => { if (dataAt == null) dataAt = performance.now() - t0; };
+    a.onplaying = () => { playAt = performance.now() - t0; setTimeout(() => { try { a.pause(); } catch (e) {} done(); }, 400); };
+    a.onerror = () => { err = 'media error (Fish error or blocked playback)'; done(); };
+    a.src = '/api/tts/stream?voice=' + encodeURIComponent(voice()) + '&text=' + encodeURIComponent(text);
+    a.play().catch((e) => { err = 'play rejected: ' + (e && e.name); done(); });
+    setTimeout(() => { if (playAt == null) { err = err || 'timeout'; done(); } }, 25000);
+  });
+}
+
+// --- full-download path (what the app used to do before streaming) ---
+async function fullBodyTiming(text) {
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/api/tts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice: voice() }),
+    });
+    const b = await r.blob();
+    return { ms: performance.now() - t0, bytes: b.size, err: r.ok ? null : 'HTTP ' + r.status };
+  } catch (e) {
+    return { ms: performance.now() - t0, bytes: 0, err: String(e) };
+  }
+}
+
+$('unlock').onclick = async () => {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) { const c = new AC(); if (c.state === 'suspended') await c.resume(); }
+    const s = new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA');
+    s.volume = 0; await s.play().catch(() => {});
+    $('run').disabled = false; $('cancel').disabled = false;
+    say('audio unlocked — run the timing');
+  } catch (e) { say('unlock failed: ' + e); }
+};
+
+$('run').onclick = async () => {
+  $('run').disabled = true;
+  say('measuring…');
+  for (const [name, text] of Object.entries(TEXTS)) {
+    const st = await streamTiming(text);
+    row('TTS first frames (streamed)', text, ms(st.dataAt), st.err || 'media element has audio', true);
+    row('playback start (streamed)', text, ms(st.playAt), st.err || 'heard the first words', true);
+    const full = await fullBodyTiming(text);
+    row('whole mp3 (old path)', text, ms(full.ms), (full.bytes ? full.bytes + ' bytes' : '') + (full.err ? ' ' + full.err : ''));
+    if (st.playAt && full.ms) row('streaming saves', text, ms(full.ms - st.playAt), 'vs waiting for the complete file', true);
+  }
+  say('done — the "streaming saves" row is the win on the TTS leg');
+  $('run').disabled = false;
+};
+
+// --- barge-in: cancel a streaming phrase mid-flight; it must stop and stay stopped ---
+$('cancel').onclick = async () => {
+  $('cancel').disabled = true;
+  say('starting a phrase, cancelling it after 500ms…');
+  const a = new Audio();
+  let stopAt = null, playedAfter = false, err = null;
+  a.src = '/api/tts/stream?voice=' + encodeURIComponent(voice()) +
+          '&text=' + encodeURIComponent('This sentence is long enough for a mid-flight interruption test. Right on.');
+  a.onerror = () => { err = 'media error (expected if the request was cut)'; };
+  await a.play().catch((e) => { err = 'play rejected: ' + (e && e.name); });
+  setTimeout(() => {
+    a.pause();
+    try { a.removeAttribute('src'); a.load(); } catch (e) {}
+    stopAt = performance.now();
+  }, 500);
+  setTimeout(() => {
+    if (!a.paused || (a.currentTime || 0) > 0.9) playedAfter = true;
+    row('barge-in cancel', 'mid-flight phrase', stopAt ? 'cancelled' : 'n/a',
+        (playedAfter ? 'FAIL — audio kept playing' : 'OK — paused with the queue dropped') + (err ? ' (' + err + ')' : ''),
+        !playedAfter);
+    say(playedAfter ? 'barge-in FAILED' : 'barge-in OK — no stale audio');
+    $('cancel').disabled = false;
+  }, 1500);
+};
+</script>
+</body>
+</html>

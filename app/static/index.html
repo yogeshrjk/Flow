@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Flow</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<link rel="stylesheet" href="/static/styles.css?v=96" />
+</head>
+<body>
+<canvas id="orb" class="wavefull" width="1280" height="240"></canvas>
+<div class="stage">
+
+  <nav id="modeSelector" class="mode-selector" role="tablist" aria-label="Learning Mode">
+    <button type="button" class="mode-btn active" data-mode="free" role="tab" aria-selected="true">
+      <i data-lucide="message-square"></i><span>Conversation</span>
+    </button>
+    <button type="button" class="mode-btn" data-mode="reading" role="tab" aria-selected="false">
+      <i data-lucide="book-open"></i><span>Reading</span>
+    </button>
+    <button type="button" class="mode-btn" data-mode="training" role="tab" aria-selected="false">
+      <i data-lucide="graduation-cap"></i><span>Training</span>
+    </button>
+    <button type="button" class="mode-btn" data-mode="roleplay" role="tab" aria-selected="false">
+      <i data-lucide="theater"></i><span>Roleplay</span>
+    </button>
+    <button type="button" class="mode-btn" data-mode="listening" role="tab" aria-selected="false" title="Listening">
+      <i data-lucide="headphones"></i><span>Listening</span>
+    </button>
+  </nav>
+
+  <header id="topbar" class="topbar hidden">
+    <div class="brand"><span id="dot" class="dot idle"></span><span id="state">READY</span><span id="micLive" class="miclive" title="microphone live"></span></div>
+    <div id="clock" class="clock">0:00</div>
+  </header>
+
+  <div id="trainingBadge" class="training-badge hidden">
+    <i data-lucide="sparkles"></i><span id="trainingTopic">Basic Sentence Structure</span>
+  </div>
+
+  <div id="roleplayBadge" class="training-badge roleplay-badge hidden">
+    <i data-lucide="theater"></i><span id="roleplayTopic">Roleplay: Choose a Scenario</span>
+  </div>
+
+  <aside id="history" class="sidebar hidden">
+    <div class="sidebarhead">
+      <span class="ptitle">Conversation</span>
+      <div style="display:flex;gap:4px;align-items:center;">
+        <button id="historyClear" class="iconbtn sm ghost" title="Clear conversation history" aria-label="Clear conversation history"><i data-lucide="trash-2"></i></button>
+        <button id="historyClose" class="iconbtn sm ghost" aria-label="Close conversation history"><i data-lucide="x"></i></button>
+      </div>
+    </div>
+    <div id="emptyHint" class="emptyhint">Your conversation will appear here…</div>
+    <div id="transcript" class="transcript side"></div>
+    <div id="chatSmoke" class="chatsmoke">
+      <div class="smoke-wisp wisp1"></div>
+      <div class="smoke-wisp wisp2"></div>
+      <div class="smoke-wisp wisp3"></div>
+    </div>
+  </aside>
+
+  <main class="center">
+    <div id="greetLine" class="greetline"></div>
+    <div id="aiLine" class="ailine"></div>
+    <div id="hearNote" class="hearnote"></div>
+  </main>
+
+  <section id="readingPanel" class="reading-panel hidden" aria-live="polite">
+    <header class="reading-head">
+      <div class="reading-titlerow">
+        <span class="reading-title">Reading Practice</span>
+        <span id="readingRoundBadge" class="reading-round-badge hidden"></span>
+      </div>
+      <div class="reading-head-actions">
+        <button id="readingFinishBtn" class="textbtn primary sm hidden" type="button" title="Finish reading now"><i data-lucide="check"></i>Done Reading</button>
+        <button id="readingClose" class="iconbtn sm ghost" type="button" aria-label="Close reading practice"><i data-lucide="x"></i></button>
+      </div>
+    </header>
+    <p id="readingInstr" class="reading-instr"></p>
+    <p id="readingPassage" class="reading-passage"></p>
+    <div id="readingStatus" class="reading-status"></div>
+    <div id="readingLiveTranscript" class="reading-livetranscript"></div>
+    <div id="readingFeedback" class="reading-feedback"></div>
+    <div id="readingContinuePrompt" class="reading-continue-prompt hidden">
+      <p class="reading-continue-question">Would you like to continue reading?</p>
+      <div class="reading-continue-options">
+        <button id="readingContinueYes" class="btn primary reading-opt-btn" type="button"><i data-lucide="check"></i>Yes</button>
+        <button id="readingContinueNo" class="btn ghost reading-opt-btn" type="button"><i data-lucide="x"></i>No</button>
+      </div>
+    </div>
+    <div id="readingActions" class="reading-actions hidden">
+      <button id="readingNewPassage" class="textbtn" type="button"><i data-lucide="refresh-cw"></i>New passage</button>
+      <button id="readingExit" class="textbtn" type="button"><i data-lucide="x"></i>Exit Reading Practice</button>
+    </div>
+  </section>
+
+  <section id="listeningPanel" class="listening-panel hidden" aria-label="Listening practice">
+    <header class="listening-head">
+      <div class="listening-titlerow">
+        <div class="listening-badge"><i data-lucide="headphones"></i><span>Listening Practice</span></div>
+        <span id="listeningScore" class="listening-score-badge"></span>
+      </div>
+      <button id="listeningClose" class="iconbtn sm ghost" type="button" aria-label="Exit listening practice"><i data-lucide="x"></i></button>
+    </header>
+
+    <div class="listening-audio-deck">
+      <button id="listeningPlay" class="listening-play-btn" type="button">
+        <div class="listening-play-icon"><i data-lucide="volume-2"></i></div>
+        <div class="listening-play-text">
+          <span class="play-title">Play Audio Clip</span>
+          <span class="play-sub">Click to listen or replay</span>
+        </div>
+      </button>
+      <div class="listening-speed-control">
+        <label for="listeningSpeed" class="speed-label"><i data-lucide="gauge"></i>Speed</label>
+        <select id="listeningSpeed" class="listening-select">
+          <option value="0.8">0.8x Slow</option>
+          <option value="1" selected>1.0x Natural</option>
+          <option value="1.15">1.15x Fast</option>
+        </select>
+      </div>
+    </div>
+    <div class="listening-voice-hint"><i data-lucide="sparkles"></i><span>Uses your selected Fish or Gemini Live voice.</span></div>
+
+    <div class="listening-question-card">
+      <div class="question-header"><i data-lucide="help-circle"></i><span>Comprehension Question</span></div>
+      <h3 id="listeningQuestion" class="listening-question-text"></h3>
+      <div id="listeningAnswers" class="listening-choices"></div>
+    </div>
+
+    <div id="learningStatus" class="learning-status-banner" role="status"></div>
+
+    <div class="listening-transcript-section">
+      <button id="listeningReveal" class="textbtn ghost sm listening-reveal-btn" type="button">
+        <i data-lucide="eye"></i><span>Reveal transcript</span>
+      </button>
+      <div id="listeningTranscriptWrap" class="listening-transcript-wrap hidden">
+        <div class="transcript-header"><i data-lucide="quote"></i><span>Audio Transcript</span></div>
+        <p id="listeningTranscript" class="listening-transcript"></p>
+      </div>
+    </div>
+
+    <div class="listening-footer-actions">
+      <button id="listeningNext" class="btn primary listening-next-btn" type="button">
+        <span>Next exercise</span><i data-lucide="arrow-right"></i>
+      </button>
+      <p class="listening-tip-note"><i data-lucide="lightbulb"></i><span>After answering, replay and say the sentences aloud. Choose a different voice in Settings.</span></p>
+    </div>
+  </section>
+
+  <footer class="dockwrap">
+    <div id="userLine" class="userline"></div>
+    <div id="chatInput" class="inputpill hidden">
+      <input id="textInput" placeholder="Type instead of speaking…" autocomplete="off" />
+      <button id="sendBtn" class="iconbtn sm" aria-label="Send"><i data-lucide="arrow-up"></i></button>
+    </div>
+    <div class="dock">
+      <button id="captionBtn" class="iconbtn hidden" aria-label="Toggle captions"><i data-lucide="captions"></i></button>
+      <button id="interruptBtn" class="iconbtn hidden" aria-label="Interrupt" disabled><i data-lucide="hand"></i></button>
+      <button id="startBtn" class="iconbtn primary" type="button" aria-label="Start or stop voice chat"><i data-lucide="play"></i></button>
+      <button id="micMuteBtn" class="iconbtn hidden" aria-label="Mute microphone"><i data-lucide="mic"></i></button>
+      <button id="muteBtn" class="iconbtn hidden" aria-label="Mute speaker"><i data-lucide="volume-2"></i></button>
+    </div>
+  </footer>
+
+  <button id="historyBtn" class="iconbtn histbtn" aria-label="Conversation history"><i data-lucide="message-square"></i></button>
+  <button id="settingsBtn" class="iconbtn settings" aria-label="Settings"><i data-lucide="settings"></i></button>
+
+  <aside id="panel" class="panel hidden">
+    <div class="panelhead">
+      <span class="ptitle">Settings</span>
+      <button id="panelClose" class="iconbtn sm ghost" aria-label="Close"><i data-lucide="x"></i></button>
+    </div>
+    <div class="panelbody">
+      <button id="dailyPlanBtn" class="daily-plan-preview-card" type="button" aria-label="Open daily learning plan and progress">
+        <div class="daily-plan-preview-top">
+          <div class="daily-plan-preview-icon"><i data-lucide="target"></i></div>
+          <div class="daily-plan-preview-meta">
+            <div class="daily-plan-preview-header">
+              <span class="daily-plan-preview-title">Daily Plan &amp; Progress</span>
+              <span id="dailyPlanBadge" class="daily-plan-level-pill">Level B1</span>
+            </div>
+            <p id="dailyPlanSummary" class="daily-plan-preview-sub">Track daily goals, fluency &amp; mistakes</p>
+          </div>
+          <i data-lucide="chevron-right" class="daily-plan-chevron"></i>
+        </div>
+        <div id="dailyPlanStatsRow" class="daily-plan-preview-stats">
+          <div class="daily-plan-stat-item">
+            <span class="stat-item-label">Spoken Today</span>
+            <span id="dailyPlanSpoken" class="stat-item-val">0.0 min</span>
+          </div>
+          <div class="daily-plan-stat-divider"></div>
+          <div class="daily-plan-stat-item">
+            <span class="stat-item-label">Tasks Done</span>
+            <span id="dailyPlanTasksDone" class="stat-item-val">0 / 5</span>
+          </div>
+          <div class="daily-plan-stat-divider"></div>
+          <div class="daily-plan-stat-item">
+            <span class="stat-item-label">Vocabulary</span>
+            <span id="dailyPlanVocab" class="stat-item-val">0 words</span>
+          </div>
+        </div>
+      </button>
+      <div class="sect">AI Response</div>
+      <div id="respModes" class="radios"></div>
+      <div id="respNote" class="pnote"></div>
+      <div class="sect">Experience</div>
+      <label class="headphones-toggle-card" for="headphonesMode">
+        <div class="toggle-card-left">
+          <div class="toggle-card-icon"><i data-lucide="headphones"></i></div>
+          <div class="toggle-card-info">
+            <span class="toggle-card-title">Headphones Interruption</span>
+            <span class="toggle-card-desc">Interrupt AI speech faster when wearing headphones</span>
+          </div>
+        </div>
+        <div class="switch-toggle">
+          <input id="headphonesMode" type="checkbox" class="switch-input" />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </div>
+      </label>
+      <label class="fld"><span class="flbl"><i data-lucide="sparkles"></i>Animation</span>
+        <select id="anim">
+          <option value="particles" selected>Particle Ribbon</option>
+          <option value="mobius">Infinity Möbius</option>
+          <option value="aurora">Aurora Silk</option>
+          <option value="nebula">Nebula Drift</option>
+        </select></label>
+      <label class="fld"><span class="flbl"><i data-lucide="mic"></i>Microphone</span>
+        <select id="micDevice"></select></label>
+      <div class="prow">
+        <button id="micTestBtn" class="textbtn" type="button"><i data-lucide="activity"></i>Test mic</button>
+        <span id="micTestStatus" class="pnote"></span>
+      </div>
+      <label id="geminiVoiceFld" class="fld"><span class="flbl"><i data-lucide="volume-2"></i>Voice</span>
+        <select id="voice"></select>
+      </label>
+      <button id="voicePickerOpen" class="voice-picker-open hidden" type="button">
+        <span><span class="voice-picker-button-title">Choose a public voice</span><small id="selectedVoiceName">Browse the Fish Audio library</small></span>
+        <i data-lucide="chevron-right"></i>
+      </button>
+      <div class="prow">
+        <button id="fishTestBtn" class="textbtn" type="button"><i data-lucide="play"></i>Test voice</button>
+        <span id="fishStatus" class="pnote"></span>
+      </div>
+      <label class="fld"><span class="flbl"><i data-lucide="languages"></i>Language</span>
+        <select id="language">
+          <option value="english" selected>English</option>
+        </select></label>
+      <input type="hidden" id="mode" value="free" />
+      <div id="practiceOptions" class="practice-options">
+        <label class="fld"><span class="flbl"><i data-lucide="theater"></i>Scenario</span>
+          <select id="scenario"></select></label>
+        <div class="grid2">
+          <label class="fld"><span class="flbl"><i data-lucide="circle-check"></i>Correction</span>
+            <select id="correction">
+              <option value="passive">Passive</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="active">Active</option>
+            </select></label>
+          <label class="fld"><span class="flbl"><i data-lucide="signal"></i>Level</span>
+            <select id="level">
+              <option value="auto" selected>Auto</option>
+              <option value="beginner">Beginner</option>
+              <option value="elementary">Elementary</option>
+              <option value="intermediate">Intermediate</option>
+              <option value="upper">Upper Intermediate</option>
+              <option value="advanced">Advanced</option>
+            </select></label>
+        </div>
+      </div>
+
+      <details class="dbg"><summary>Debug log</summary><pre id="log" class="log"></pre></details>
+
+    </div>
+  </aside>
+  <div id="scrim" class="scrim hidden"></div>
+
+</div>
+<div id="dailyPanel" class="daily-modal daily-panel hidden" role="dialog" aria-modal="true" aria-labelledby="dailyTitle">
+  <section class="daily-dialog">
+    <header class="daily-head">
+      <div class="daily-title-group">
+        <div class="daily-badge"><i data-lucide="target"></i><span>DAILY LEARNING PLAN</span></div>
+        <h2 id="dailyTitle" class="daily-title">Your Daily Practice</h2>
+        <p class="daily-subtitle">Track your fluency progress, review target patterns, and complete daily tasks.</p>
+      </div>
+      <button id="dailyClose" class="iconbtn sm ghost" type="button" aria-label="Close daily practice"><i data-lucide="x"></i></button>
+    </header>
+
+    <div class="daily-section">
+      <div class="daily-sect-label"><i data-lucide="bar-chart-2"></i><span>Today's Overview</span></div>
+      <div id="dailyProgress" class="daily-stats-grid"></div>
+    </div>
+
+    <div class="daily-section">
+      <div class="daily-sect-label"><i data-lucide="check-square"></i><span>Daily Tasks</span></div>
+      <div id="dailyTasks" class="daily-tasks-list"></div>
+    </div>
+
+    <div class="daily-section">
+      <div class="daily-sect-label"><i data-lucide="repeat"></i><span>Review Recurring Mistakes</span></div>
+      <div id="dailyReviews" class="daily-reviews-list"></div>
+    </div>
+
+    <div class="daily-section">
+      <div class="daily-sect-label"><i data-lucide="award"></i><span>Starting Assessment</span></div>
+      <div class="daily-assessment-card">
+        <p class="daily-assessment-desc">Give three different descriptive answers: describe your routine, explain a past event, and share an opinion with a reason.</p>
+        <textarea id="placementText" class="daily-textarea" rows="3" maxlength="2000" placeholder="Type a descriptive answer here (aim for at least 10 words, 100 words across 3 samples)…" aria-label="Assessment answer"></textarea>
+        <div class="daily-assessment-actions">
+          <button id="placementSubmit" class="btn primary placement-submit-btn" type="button"><i data-lucide="send"></i><span>Add assessment answer</span></button>
+        </div>
+        <div id="placementStatus" class="placement-status-msg" role="status"></div>
+      </div>
+    </div>
+
+    <div class="daily-section">
+      <div class="daily-sect-label"><i data-lucide="history"></i><span>Practice History &amp; Evidence</span></div>
+      <div id="dailyHistory" class="daily-history-wrap"></div>
+      <div id="dailyEvidence" class="daily-evidence-card pnote"></div>
+    </div>
+  </section>
+</div>
+<div id="voicePicker" class="voice-picker hidden" role="dialog" aria-modal="true" aria-labelledby="voicePickerTitle">
+  <section class="voice-picker-dialog">
+    <header class="voice-picker-head">
+      <div>
+        <h2 id="voicePickerTitle">Choose an AI voice</h2>
+        <p>Preview a public voice, then use it for your conversation.</p>
+      </div>
+      <button id="voicePickerClose" class="iconbtn sm ghost" type="button" aria-label="Close voice picker"><i data-lucide="x"></i></button>
+    </header>
+    <nav class="voice-picker-tabs" role="tablist" aria-label="Voice categories">
+      <button id="voiceTabExplore" class="voice-picker-tab active" type="button" role="tab" aria-selected="true">Explore</button>
+      <button id="voiceTabDefault" class="voice-picker-tab" type="button" role="tab" aria-selected="false">Default Voices</button>
+      <button id="voiceTabBookmarked" class="voice-picker-tab" type="button" role="tab" aria-selected="false">Bookmarked</button>
+    </nav>
+    <div class="voice-picker-controls">
+      <label class="fld"><span class="flbl"><i data-lucide="globe-2"></i>Language</span>
+        <select id="fishLibraryLanguage"></select></label>
+      <div class="fld"><span class="flbl"><i data-lucide="search"></i>Search voices</span>
+        <div class="voice-search-row">
+          <input id="fishLibrarySearch" class="library-search" type="search" placeholder="Search by voice name…" autocomplete="off" />
+          <button id="voiceFilterOpen" class="voice-filter-open" type="button" aria-label="Filter voices" aria-haspopup="dialog" aria-expanded="false">
+            <i data-lucide="sliders-horizontal"></i><span>Filters</span><span id="voiceFilterCount" class="voice-filter-count hidden"></span>
+          </button>
+        </div>
+      </div>
+    </div>
+    <div id="fishLibraryNote" class="library-note" role="status" aria-live="polite">Choose a language to browse public voices.</div>
+    <div id="fishLibraryGrid" class="voice-library-grid"></div>
+    <div class="library-actions">
+      <button id="fishLibraryMore" class="textbtn hidden" type="button">Load more</button>
+      <button id="fishLibraryRetry" class="textbtn hidden" type="button">Retry</button>
+    </div>
+  </section>
+</div>
+<div id="voiceFilterOverlay" class="voice-filter-overlay hidden">
+  <section class="voice-filter-dialog" role="dialog" aria-modal="true" aria-labelledby="voiceFilterTitle">
+    <header class="voice-filter-head">
+      <div>
+        <h2 id="voiceFilterTitle">Filter voices</h2>
+        <p>Filters use details in voice tags and descriptions.</p>
+      </div>
+      <button id="voiceFilterClose" class="iconbtn sm ghost" type="button" aria-label="Close filters"><i data-lucide="x"></i></button>
+    </header>
+    <div class="voice-filter-body">
+      <label class="fld"><span class="flbl">Voice gender</span>
+        <select id="voiceFilterGender"><option value="">Any gender</option></select>
+        <span id="voiceFilterGenderNote" class="voice-filter-hint hidden"></span>
+      </label>
+      <label class="fld"><span class="flbl">Age</span>
+        <select id="voiceFilterAge"><option value="">Any age</option></select>
+        <span id="voiceFilterAgeNote" class="voice-filter-hint hidden"></span>
+      </label>
+      <fieldset class="voice-filter-group">
+        <legend>Tags</legend>
+        <div id="voiceFilterTags" class="voice-filter-options"></div>
+      </fieldset>
+      <fieldset class="voice-filter-group">
+        <legend>Voice qualities</legend>
+        <div id="voiceFilterQualities" class="voice-filter-options"></div>
+      </fieldset>
+    </div>
+    <footer class="voice-filter-footer">
+      <button id="voiceFilterReset" class="textbtn" type="button">Reset</button>
+      <button id="voiceFilterDone" class="textbtn primary-filter" type="button">Show voices</button>
+    </footer>
+  </section>
+</div>
+<script src="/static/vad.js?v=43"></script>
+<script src="/static/audio.js?v=45"></script>
+<script src="/static/orb.js?v=50"></script>
+<script src="/static/app.js?v=158"></script>
+<script src="/static/learning.js?v=4"></script>
+</body>
+</html>
